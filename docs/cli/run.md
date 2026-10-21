@@ -33,6 +33,10 @@ fullsend run <agent-name> [flags]
 
 ## Plan block
 
+OpenCode runs require `security.enabled: true` for every role. The former security-disabled
+workaround is rejected before sandbox creation. See [OpenCode](../runtimes/opencode.md) for
+the supported version and security controls.
+
 At startup, `fullsend run` prints a plan block summarizing the resolved configuration:
 
 ```

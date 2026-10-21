@@ -6,8 +6,8 @@
 # run also proves an agent that declares Bash keeps the trusted pattern rules
 # rather than losing bash to its own "*": "deny".
 #
-# OpenCode has no sandbox tool hooks yet (unbound-force#515), so the harness
-# sets security.enabled: false, as docs/runtimes/opencode.md requires.
+# OpenCode requires sandbox security hooks (unbound-force#515), so the harness
+# keeps security.enabled: true.
 #
 # Gated on the `runtime-opencode` capability, which the Makefile does not
 # declare: fullsend-sandbox:latest carries OpenCode only once the image change
@@ -37,7 +37,7 @@ Feature: OpenCode runtime runs an agent unattended
       providers:
         - providers/vertex-ai.yaml
       security:
-        enabled: false
+        enabled: true
       host_files:
         - src: ${GOOGLE_APPLICATION_CREDENTIALS}
           dest: /tmp/.gcp-credentials.json
