@@ -150,6 +150,9 @@ jobs:
             fullsend-sandbox:ci-smoke -ec '
               id
               test -w /sandbox/opencode-config
+              for binary in /usr/local/bin/opencode /usr/local/bin/rg /usr/local/bin/tirith; do
+                test "$(stat -c %U "$binary")" = root
+              done
               python3 -c "import sys; assert sys.version_info >= (3, 11), sys.version"
               command -v tirith
             '
