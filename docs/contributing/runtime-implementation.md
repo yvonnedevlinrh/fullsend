@@ -169,6 +169,9 @@ How the shared PostToolUse chain reaches each runtime — the three sanitizer ro
   introducing image-owned enforcement storage. Files remain writable by the same sandbox user;
   the verification-to-load race is explicitly unresolved. Stronger OS-backed storage is left for
   separate cross-runtime review and is not claimed as part of #7824.
+- **OpenCode migration:** harnesses that previously set `security.enabled: false` must remove that
+  workaround or set it to `true`. Additional native `OPENCODE_CONFIG_CONTENT.plugin` entries are
+  rejected; the runner supplies and verifies the required adapter itself.
 - **OpenCode runner-held environment:** Bootstrap reads the pristine harness-delivered
   `OPENCODE_CONFIG_CONTENT` and `GOOGLE_APPLICATION_CREDENTIALS` values before any agent iteration,
   stores them on the runner keyed by sandbox name, and Run restores them after sourcing the
@@ -544,7 +547,7 @@ The inference profiles (`profiles/fullsend-vertex-ai.yaml` in this repo and in f
 
 ## Sandbox workspace layout
 
-The sandbox has two key directories that map to Claude Code's config levels (plus a runner-owned config directory per additional runtime, e.g. `pi-config/` for pi and `codex-config/` for codex):
+The sandbox has two key directories that map to Claude Code's config levels (plus a runner-owned config directory per additional runtime, e.g. `pi-config/` for pi, `codex-config/` for codex, and `opencode-config/` for OpenCode):
 
 ```
 /sandbox/
@@ -567,6 +570,10 @@ The sandbox has two key directories that map to Claude Code's config levels (plu
 │                                       populated by CodexRuntime.Bootstrap (#6920, follow-up PR)
 │   └── agents/<role>.toml              Native sub-agent roles (skill personas plus default and explore), written only
 │                                       when the ADR 0126 gate holds; runner-held digests, checked by the spawn guard (#6970)
+│
+├── opencode-config/                 ← OPENCODE_CONFIG_DIR (OpenCode runtime)
+│   ├── plugins/fullsend-hooks.ts       Native security hook adapter, uploaded and digest-verified by Bootstrap
+│   └── hooks/*.py                      Selected shared security hook scripts, uploaded and digest-verified by Bootstrap
 │
 ├── claude-config/                   ← CLAUDE_CONFIG_DIR (personal level)
 │   ├── agents/

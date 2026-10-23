@@ -11,14 +11,15 @@ implementation's scope.
 
 Bootstrap uploads the Go-embedded adapter and selected shared Python scripts to
 `/sandbox/opencode-config`, following pi's deployment pattern. The image supplies
-the pinned OpenCode binary and SDK dependencies. Hook changes travel with the
+the pinned OpenCode binary and SDK dependencies. Use a sandbox image that includes
+OpenCode 1.19.1 and the matching SDK. Hook changes travel with the
 runner and do not require baking those scripts into the image.
 
 ## Run it locally
 
 Complete [Running agents locally](../guides/user/running-agents-locally.md) first. The CLI,
-OpenShell, credentials and the agents clone are the same. The fleet sandbox image includes the
-pinned OpenCode (1.19.1).
+OpenShell, credentials and the agents clone are the same. Use a fleet sandbox image that includes
+the pinned OpenCode (1.19.1).
 
 **1. Write the tool policy.** OpenCode reads its global config, including the tool-permission
 policy, from `OPENCODE_CONFIG_CONTENT`. A run fails before it starts when the variable is empty or

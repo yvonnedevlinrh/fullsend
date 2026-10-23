@@ -12,7 +12,8 @@
 #     and build-time assertion as Claude Code — stub runtime, see #6920)
 #   - OpenCode (GitHub release, SHA256-verified glibc build via
 #     OPENCODE_VERSION + per-arch checksum ARGs; opt-in runtime, see
-#     unbound-force#510)
+#     unbound-force#510) + @opencode-ai/plugin SDK (npm, version-matched to
+#     OPENCODE_VERSION; baked at /sandbox/opencode-config/node_modules)
 #   - jq (JSON parsing in agent scripts and skills)
 #   - ripgrep + fd (backends of pi's built-in grep/find tools; SHA256-verified
 #     static builds, versions asserted at build time)
@@ -337,6 +338,8 @@ RUN mkdir -p /etc/codex \
 # (same shadow-proof pattern as Claude Code above).
 # To update: bump OPENCODE_VERSION and OPENCODE_SHA256_{AMD64,ARM64} from:
 #   https://github.com/anomalyco/opencode/releases
+# The same version selects the baked @opencode-ai/plugin SDK; verify that the
+# matching package version exists on npm before updating this pin.
 ARG OPENCODE_VERSION=1.19.1
 ARG OPENCODE_SHA256_AMD64=6f1904b860bdbd32e90e679c9e1b0e64e78269a353e1497d5ea792dfa449538c
 ARG OPENCODE_SHA256_ARM64=3840e9afb2462a666d31816b20bc13b91af9845c329cff660a972aa9cfaee3a2
@@ -364,8 +367,10 @@ RUN case "$TARGETARCH" in \
          exit 1; \
        fi
 
-# Match pi's bootstrap-uploaded adapter model. The runner installs and verifies
-# the adapter/scripts here; this writable config tree is not an OS boundary.
+# OPENCODE_CONFIG_DIR must match sandbox.SandboxOpenCodeConfig
+# (internal/sandbox/sandbox.go). Match pi's bootstrap-uploaded adapter model:
+# the runner installs and verifies the adapter/scripts here; this writable
+# config tree is not an OS boundary.
 RUN install -d -o root -g sandbox -m 0775 /sandbox/opencode-config
 # OpenCode installs its plugin SDK during config discovery even when a local
 # plugin imports only builtins. Bake it in so startup needs no npm egress.
