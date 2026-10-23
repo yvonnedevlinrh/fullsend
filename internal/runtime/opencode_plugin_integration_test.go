@@ -65,7 +65,6 @@ type openCodeProbeEvent struct {
 	SessionID   string `json:"sessionID"`
 	CallID      string `json:"callID"`
 	Description string `json:"description"`
-	SawOriginal bool   `json:"sawOriginal"`
 }
 
 type openCodeProbeCall struct {

@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, readFileSyn
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const plugin = (await import(pathToFileURL(process.env.FULLSEND_TEST_ADAPTER))).default;
 
@@ -75,6 +75,9 @@ test("native write paths resolve symlinks and protect runner state", async (t) =
   for (const filePath of ["../escape", "outside/escape", "broken", ".env", ".security/findings.jsonl", "runner-state/file"]) {
     await assert.rejects(h.before("write", { filePath }), /write path/);
   }
+  for (const tool of ["edit", "multiedit"]) {
+    await assert.rejects(h.before(tool, { filePath: "../escape" }), /write path/);
+  }
   await assert.rejects(h.before("apply_patch", { patchText: "*** Add File: ../escape\n+x" }), /write path/);
   await assert.rejects(h.before("apply_patch", { patchText: "unrecognized" }), /unrecognized/);
 });
@@ -92,12 +95,21 @@ test("scripts receive translated v2 payload, isolated environment and chained ou
   process.env.PYTHONPATH = h.root;
   process.env.FULLSEND_CANARY_TOKEN = "untrusted";
   process.env.FULLSEND_OPENCODE_HOOK_CONFIG = "null";
+  t.after(() => {
+    delete process.env.PYTHONPATH;
+    delete process.env.FULLSEND_CANARY_TOKEN;
+    delete process.env.FULLSEND_OPENCODE_HOOK_CONFIG;
+  });
   await h.before("read", { filePath: "file" });
   const result = await h.after("read", {}, "original");
   assert.equal(result.output, "sanitized");
   assert.deepEqual(result.metadata, {});
   assert.deepEqual(result.attachments, []);
-  delete process.env.PYTHONPATH;
+});
+
+test("hook script names cannot escape the hook directory", async (t) => {
+  const h = await setup(t, { groups: [{ Phase: "PreToolUse", Tools: ["*"], Scripts: ["../escape.py"] }] });
+  await assert.rejects(h.before("read", {}), /invalid hook script name/);
 });
 
 test("script failure, malformed replies and tampering all fail closed", async (t) => {
@@ -116,8 +128,9 @@ test("script failure, malformed replies and tampering all fail closed", async (t
 });
 
 test("denial diagnostics retain useful details without secrets or canaries", async (t) => {
+  const hooksDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "../../security/hooks");
   const sanitizers = Object.fromEntries(["hook_io.py", "secret_redact_posttool.py"].map((file) =>
-    [file, readFileSync(path.join("../security/hooks", file), "utf8")]));
+    [file, readFileSync(path.join(hooksDir, file), "utf8")]));
   const token = "ghp_" + "A".repeat(36);
   const canary = "FULLSEND_REASON_CANARY";
   const cases = [

@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,6 +32,15 @@ func TestOpenCodeHookAdapter(t *testing.T) {
 	cmd.Env = append(os.Environ(), "FULLSEND_TEST_ADAPTER="+adapter, "FULLSEND_TEST_PYTHON="+python)
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "%s", out)
+}
+
+func TestOpenCodeApplyBashPatternsPreservesTrustedPatterns(t *testing.T) {
+	permission := map[string]any{"bash": map[string]any{"gh *": "allow", "*": "deny"}}
+	rules := []openCodePermissionRule{{Key: "bash", Value: json.RawMessage(`{"gh *":"allow","*":"deny"}`)}}
+
+	openCodeApplyBashPatterns(permission, []string{"curl"}, rules)
+
+	assert.Equal(t, map[string]any{"gh *": "allow", "*": "deny"}, permission["bash"])
 }
 
 func TestOpenCodeBootstrapHookPlan(t *testing.T) {

@@ -54,12 +54,14 @@ function checkBash(command, allowlist) {
 
 function checkFiles(cfg) {
   if (!cfg || !Array.isArray(cfg.groups) || !cfg.digests || !path.isAbsolute(cfg.dir)) deny("hook policy unavailable");
-  if (!lstatSync(cfg.dir).isDirectory() || lstatSync(cfg.dir).isSymbolicLink()) deny("invalid hook directory");
+  const dirInfo = lstatSync(cfg.dir);
+  if (!dirInfo.isDirectory() || dirInfo.isSymbolicLink()) deny("invalid hook directory");
   const entries = readdirSync(cfg.dir);
   if (entries.length !== Object.keys(cfg.digests).length) deny("hook directory changed");
   for (const file of entries) {
     const target = path.join(cfg.dir, file);
-    if (!lstatSync(target).isFile() || lstatSync(target).isSymbolicLink() || digest(readFileSync(target)) !== cfg.digests[file]) {
+    const targetInfo = lstatSync(target);
+    if (!targetInfo.isFile() || targetInfo.isSymbolicLink() || digest(readFileSync(target)) !== cfg.digests[file]) {
       deny("hook script missing or modified");
     }
   }
@@ -162,6 +164,9 @@ export default async ({ directory }) => {
     for (const group of cfg.groups) {
       if (group.Phase !== phase || !(group.Tools.includes("*") || group.Tools.includes(tool))) continue;
       for (const script of group.Scripts) {
+        if (typeof script !== "string" || path.basename(script) !== script || script === "." || script === "..") {
+          deny("invalid hook script name");
+        }
         const payload = { hook_event_name: phase, tool_name: tool, tool_input: toolInput, cwd };
         if (phase === "PostToolUse") Object.assign(payload, { tool_response: value, tool_result: value });
         const result = spawnSync(cfg.python, ["-I", "-S", "-B", "-c",
