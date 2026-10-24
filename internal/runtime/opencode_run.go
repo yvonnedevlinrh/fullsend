@@ -541,7 +541,7 @@ func (r OpenCodeRuntime) openCodeOverridePaths(withAgentDir bool) string {
 
 // Follow pi's runner-held verification model, including before debug loading.
 func (r OpenCodeRuntime) restoreOpenCodeAgent(sandboxName, agentName string, env openCodeTrustedEnv) error {
-	if err := codexExecOK(sandboxName, openCodeHookGuard(env.Hooks), "verifying OpenCode hooks before agent restore"); err != nil {
+	if err := codexExecOK(sandboxName, openCodeHookGuardCommand(env.Hooks), "verifying OpenCode hooks before agent restore"); err != nil {
 		return err
 	}
 	if err := codexExecOK(sandboxName, "rm -rf -- "+r.openCodeOverridePaths(true), "clearing OpenCode agent overrides"); err != nil {

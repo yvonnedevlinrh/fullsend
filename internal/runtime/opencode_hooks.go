@@ -113,6 +113,12 @@ func openCodeHookGuard(cfg *openCodeHookConfig) string {
 	}) + " && " + codexHookScriptsGuard(cfg.Dir, cfg.Digests)
 }
 
+// openCodeHookGuardCommand pins the utilities that openCodeHookGuard invokes
+// when the guard is executed outside the Run command's already-pinned shell.
+func openCodeHookGuardCommand(cfg *openCodeHookConfig) string {
+	return openCodeUtilityPin() + " && " + openCodeHookGuard(cfg)
+}
+
 // Used after .env, before any command-p based guard: shell functions must not
 // impersonate builtins/utilities, and loader variables must not reach them.
 const openCodeHookFunctionsUnset = "unset -f command test '[' echo printf cut sha256sum find wc stat"

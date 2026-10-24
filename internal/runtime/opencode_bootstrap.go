@@ -130,7 +130,7 @@ func (r OpenCodeRuntime) Bootstrap(input BootstrapInput) error {
 	if err != nil {
 		return err
 	}
-	if err := codexExecOK(sandboxName, openCodeHookGuard(trustedEnv.Hooks), "verifying OpenCode hooks before agent verification"); err != nil {
+	if err := codexExecOK(sandboxName, openCodeHookGuardCommand(trustedEnv.Hooks), "verifying OpenCode hooks before agent verification"); err != nil {
 		return err
 	}
 	if err := openCodeVerifyAgent(sandboxName, agentName, r); err != nil {

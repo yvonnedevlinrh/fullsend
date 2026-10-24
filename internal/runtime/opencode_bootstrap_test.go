@@ -515,6 +515,9 @@ exit 0
 	calls, readErr := os.ReadFile(logPath)
 	require.NoError(t, readErr)
 	assert.Contains(t, string(calls), "refusing to run unhooked", "adapter checked before debug verification")
+	env, ok := lookupOpenCodeTrustedEnv("sb")
+	require.True(t, ok)
+	assert.Contains(t, string(calls), openCodeHookGuardCommand(env.Hooks), "adapter guard pins its utilities before restore")
 	assert.Contains(t, string(calls), agentPath, "agent file re-uploaded before the run")
 	assert.Contains(t, string(calls), "debug agent", "agent re-verified before the run")
 }

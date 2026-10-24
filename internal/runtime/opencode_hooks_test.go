@@ -58,6 +58,7 @@ func TestOpenCodeBootstrapHookPlan(t *testing.T) {
 	log, err := os.ReadFile(filepath.Join(work, "log"))
 	require.NoError(t, err)
 	assert.Contains(t, string(log), "refusing to run unhooked")
+	assert.Contains(t, string(log), openCodeHookGuardCommand(env.Hooks))
 	assert.Equal(t, openCodeHookAdapter, storedUpload(t, store, OpenCodeRuntime{}.openCodeHooksExtensionPath()))
 	for name, content := range security.HookFiles(in.hooks) {
 		assert.Equal(t, codexAssetSHA256(content), env.Hooks.Digests[name])
@@ -133,6 +134,12 @@ func TestOpenCodeMissingHookPolicy(t *testing.T) {
 	var exit *exec.ExitError
 	require.ErrorAs(t, err, &exit, "%s", out)
 	assert.Equal(t, 97, exit.ExitCode())
+}
+
+func TestOpenCodeHookGuardCommandPinsUtilities(t *testing.T) {
+	command := openCodeHookGuardCommand(nil)
+	assert.True(t, strings.HasPrefix(command, openCodeUtilityPin()+" && "))
+	assert.Contains(t, command, "hook policy not recorded")
 }
 
 func TestOpenCodeAdapterVersionMatchesImage(t *testing.T) {
