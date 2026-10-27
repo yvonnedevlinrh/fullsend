@@ -318,6 +318,7 @@ func TestGetIssue_StringLabels(t *testing.T) {
 			"description": "Issue body",
 			"web_url":     "https://gitlab.com/myorg/myrepo/-/issues/5",
 			"labels":      []string{"feature", "docs"},
+			"state":       "opened",
 		})
 	})
 
@@ -327,6 +328,8 @@ func TestGetIssue_StringLabels(t *testing.T) {
 	assert.Equal(t, "Test issue", issue.Title)
 	assert.Equal(t, "Issue body", issue.Body)
 	assert.Equal(t, []string{"feature", "docs"}, issue.Labels)
+	assert.Equal(t, "open", issue.State, "GitLab's \"opened\" is normalized to \"open\"")
+	assert.Empty(t, issue.StateReason)
 }
 
 func TestGetIssue_ObjectLabels(t *testing.T) {
@@ -343,12 +346,14 @@ func TestGetIssue_ObjectLabels(t *testing.T) {
 				{"title": "alpha"},
 				{"title": "beta"},
 			},
+			"state": "closed",
 		})
 	})
 
 	issue, err := client.GetIssue(ctx, "myorg", "myrepo", 7)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"alpha", "beta"}, issue.Labels)
+	assert.Equal(t, "closed", issue.State)
 }
 
 func TestGetIssue_NotFound(t *testing.T) {
@@ -3463,6 +3468,16 @@ func TestErrNotSupported_OrgMethods(t *testing.T) {
 	})
 }
 
+func TestErrNotSupported_FileMethods(t *testing.T) {
+	client, _ := setupTest(t)
+	ctx := context.Background()
+
+	t.Run("UpdateFileIfMatch", func(t *testing.T) {
+		err := client.UpdateFileIfMatch(ctx, "org", "repo", "f", "m", []byte("x"), "")
+		require.ErrorIs(t, err, forge.ErrNotSupported)
+	})
+}
+
 func TestErrNotSupported_WorkflowMethods(t *testing.T) {
 	client, _ := setupTest(t)
 	ctx := context.Background()
@@ -4953,6 +4968,103 @@ func TestUpdateRepoSecret_MaskingRequiredNoUnmaskedFallback(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must not be stored unmasked")
 	assert.Equal(t, 1, callCount, "must not retry with masked:false")
+}
+
+// genericValueInvalid is the 400 body some GitLab instances return when a
+// value cannot be masked (e.g. it is shorter than 8 characters), without
+// mentioning masking.
+var genericValueInvalid = map[string]any{"message": map[string]any{"value": []string{"is invalid"}}}
+
+func TestCreateRepoSecret_MaskedFallbackOnGenericValueInvalid(t *testing.T) {
+	client, mux := setupTest(t)
+	ctx := context.Background()
+
+	callCount := 0
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/variables", func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var body map[string]any
+		readJSONBody(t, r, &body)
+		if body["masked"] == true {
+			writeJSON(t, w, http.StatusBadRequest, genericValueInvalid)
+			return
+		}
+		assert.Equal(t, "seqe-ai", body["value"])
+		assert.Equal(t, true, body["protected"])
+		writeJSON(t, w, http.StatusCreated, map[string]any{"key": forge.SecretGCPProjectID})
+	})
+
+	err := client.CreateRepoSecret(ctx, "myorg", "myrepo", forge.SecretGCPProjectID, "seqe-ai")
+	require.NoError(t, err)
+	assert.Equal(t, 2, callCount, "should retry with masked:false after generic value error")
+}
+
+func TestUpdateRepoSecret_MaskedFallbackOnGenericValueInvalid(t *testing.T) {
+	client, mux := setupTest(t)
+	ctx := context.Background()
+
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/variables", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, http.StatusConflict, map[string]string{
+			"message": forge.SecretGCPProjectID + " has already been taken",
+		})
+	})
+
+	callCount := 0
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/variables/"+forge.SecretGCPProjectID, func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		assert.Equal(t, http.MethodPut, r.Method)
+		var body map[string]any
+		readJSONBody(t, r, &body)
+		if body["masked"] == true {
+			writeJSON(t, w, http.StatusBadRequest, genericValueInvalid)
+			return
+		}
+		writeJSON(t, w, http.StatusOK, map[string]any{"key": forge.SecretGCPProjectID})
+	})
+
+	err := client.CreateRepoSecret(ctx, "myorg", "myrepo", forge.SecretGCPProjectID, "seqe-ai")
+	require.NoError(t, err)
+	assert.Equal(t, 2, callCount, "should retry PUT with masked:false after generic value error")
+}
+
+func TestCreateRepoSecret_MaskingRequiredGenericValueInvalid(t *testing.T) {
+	client, mux := setupTest(t)
+	ctx := context.Background()
+
+	callCount := 0
+	mux.HandleFunc("/api/v4/projects/myorg%2Fmyrepo/variables", func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		var body map[string]any
+		readJSONBody(t, r, &body)
+		assert.Equal(t, true, body["masked"], "must never send masked:false")
+		writeJSON(t, w, http.StatusBadRequest, genericValueInvalid)
+	})
+
+	err := client.CreateRepoSecret(ctx, "myorg", "myrepo", forge.SecretOpenAIAPIKey, "short")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must not be stored unmasked")
+	assert.Equal(t, 1, callCount, "must not retry with masked:false")
+}
+
+func TestIsMaskingError(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		msg    string
+		want   bool
+	}{
+		{name: "explicit mask message", status: http.StatusBadRequest, msg: "This variable can not be masked", want: true},
+		{name: "generic value invalid", status: http.StatusBadRequest, msg: "value: [is invalid]", want: true},
+		{name: "value invalid among other fields", status: http.StatusBadRequest, msg: "key: [is too long]; value: [is invalid]", want: true},
+		{name: "key invalid", status: http.StatusBadRequest, msg: "key: [is invalid]", want: false},
+		{name: "plain key is invalid", status: http.StatusBadRequest, msg: "key is invalid", want: false},
+		{name: "value too long", status: http.StatusBadRequest, msg: "value: [is too long]", want: false},
+		{name: "value invalid wrong status", status: http.StatusUnprocessableEntity, msg: "value: [is invalid]", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isMaskingError(&APIError{StatusCode: tt.status, Message: tt.msg}))
+		})
+	}
 }
 
 func TestCreatePipelineSchedule_CleansUpOnVariableFailure(t *testing.T) {

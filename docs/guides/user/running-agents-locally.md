@@ -239,12 +239,17 @@ custom agent definitions exist.
 
 ### Triage agent
 
+The built-in triage and code agents still read `GITHUB_ISSUE_URL` from their
+GitHub overlays. Set both URL variables until the agents repository migrates
+to `FULLSEND_WORK_ITEM_URL`.
+
 Add to an env file:
 
 ```bash
 # fullsend-triage.env
 GH_TOKEN={github-pat}
 GITHUB_ISSUE_URL=https://github.com/{org}/{repo}/issues/{issue_num}
+FULLSEND_WORK_ITEM_URL=https://github.com/{org}/{repo}/issues/{issue_num}
 ```
 
 ```bash
@@ -297,6 +302,7 @@ GH_TOKEN={github-pat}
 PUSH_TOKEN={github-pat}
 PUSH_TOKEN_SOURCE=pat
 GITHUB_ISSUE_URL=https://github.com/{org}/{repo}/issues/{issue_num}
+FULLSEND_WORK_ITEM_URL=https://github.com/{org}/{repo}/issues/{issue_num}
 REPO_FULL_NAME={org}/{repo}
 ISSUE_NUMBER={issue_num}
 CODE_ALLOWED_TARGET_BRANCHES=main
@@ -386,6 +392,9 @@ or a cached artifact is missing, `fullsend run` falls back to normal network
 resolution and prints a warning suggesting you re-run `fullsend lock`.
 
 Use `--update` to force re-resolution even if the lock entry appears current.
+A current entry is also not composed, so `fullsend lock` does not check it for
+reserved `env.sandbox` keys; see
+[Reserved `env.sandbox` keys](../../cli/run.md#reserved-envsandbox-keys).
 
 ### Status notification flags
 

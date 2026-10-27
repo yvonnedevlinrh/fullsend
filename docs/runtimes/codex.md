@@ -140,9 +140,12 @@ refuse some levels with an upstream 400. Check the levels your model accepts bef
 | Extra knobs | `FULLSEND_CODEX_MODEL` (the runner-side model default for codex runs; see [Models](#models)) |
 | Not supported | Sub-agents, `plugins:`, fallback chains, non-OpenAI providers (other than through a Responses-capable inference gateway), Chat Completions or Messages on a gateway |
 
-Cost is **not** in `metrics.json` on codex: the `codex exec --json` stream carries no cost field, so
-the value stays `0`. Token counts are recorded normally on the direct route; through a gateway they
-can read 0 (see [Models through an inference gateway](#models-through-an-inference-gateway-experimental)).
+Cost is recorded as **zero** in `metrics.json` on codex: the
+`codex exec --json` stream carries no cost field, so the value stays `0`.
+Token counts are recorded normally on the direct route; through a gateway
+they can read 0 (see [Models through an inference gateway](#models-through-an-inference-gateway-experimental)).
+See [Computing dollar cost from token telemetry](../guides/infrastructure/distributed-tracing.md#computing-dollar-cost-from-token-telemetry)
+for a list-price estimate from `run-telemetry.jsonl`, including Codex reasoning tokens.
 
 ## Running it locally
 
@@ -220,6 +223,39 @@ What a local codex run needs, beyond the guide:
   loads as instructions. Only the root file is read, cut at 32 KiB: nested `AGENTS.md` files and
   `AGENTS.override.md` are not, and a symlinked `AGENTS.md` is skipped. No `CLAUDE.md` bridge is
   injected.
+- **`.env` is read as data, not run.** The launch parses the sandbox `.env` with a `python3` resolved
+  before anything the agent wrote (`-I -S`) and evals only the single-quoted `[export ]NAME='value'`
+  lines that parser prints, so no line of `.env` executes as shell. Only `NAME=value`, `export NAME` and comments are taken;
+  anything else is ignored with a warning naming the file and line. `LD_PRELOAD`,
+  `LD_LIBRARY_PATH`, `LD_AUDIT`, every `PYTHON*` variable, `BASH_ENV`, `ENV`, `IFS` and the launch's own read-only
+  pins are never taken from `.env` (#8498). The sandbox image needs `python3` for this, in a
+  `PATH` directory the sandbox user neither owns nor can write; without one the launch fails with
+  `python3 not found in a PATH directory the agent cannot write` (exit 127).
+  It also needs `readlink` there as a regular file, not a symlink; without one the launch also
+  prints `no readlink that is a regular file in a PATH directory the agent cannot write`.
+  With sandbox hooks on, that `python3` must also be 3.11 or newer; an older one fails Bootstrap
+  with `hook interpreter ... needs at least 3.11`.
+- **Sandbox hook settings come from the harness, not `.env`.** With sandbox
+  hooks on, `TIRITH_FAIL_ON`, `TIRITH_REQUIRED`, `FULLSEND_EGRESS_ALLOWLIST`,
+  `FULLSEND_CANARY_TOKEN` and `FULLSEND_TOOL_ALLOWLIST` are taken from the
+  harness configuration at Bootstrap, before the first iteration. The launch
+  sets them again after it reads `.env`, and unsets any of them the harness did
+  not set. A value in `.env`, including one the agent wrote there, cannot change
+  them.
+- **`codex` and `node` come from directories the agent cannot write.** The
+  launch pins the first `codex` in a `PATH` directory the sandbox user neither
+  owns nor can write, judged by the file it resolves to and every directory
+  above that file. `codex` on `PATH` is npm's `#!/usr/bin/env node` launcher,
+  so the launch also pins `node` by the same rule and starts the launcher with
+  it. It does not let `env` look `node` up on the `PATH` left after `.env` is
+  read. A `codex` or `node` found only through an agent-writable directory, or
+  a symlink into one, fails the launch with
+  `codex not found in a PATH directory the agent cannot write` or
+  `node not found in a PATH directory the agent cannot write` (exit 127). Any
+  other first line that starts `codex` through `env` (`#!/usr/bin/env -S node`,
+  say) fails it with
+  `starts through env with a first line other than '#!/usr/bin/env node'`. The
+  `PATH` that codex and its tools inherit does not change.
 - **The repository's own `.codex/` config is never loaded.** fullsend pins the cloned repo's
   project trust to untrusted, so `.codex/config.toml` and `.codex/hooks.json` (model, instructions,
   MCP servers, hooks) never apply. A target repo cannot change how the agent runs.
@@ -253,7 +289,8 @@ What a local codex run needs, beyond the guide:
   project is untrusted; that is not documented upstream and may change, so keep repository skills
   in `.agents/skills`. Codex's bundled skills (`skill-installer`, `imagegen` and friends) are
   switched off, so an agent sees only yours.
-- **No cost in metrics** — see [At a glance](#at-a-glance).
+- **Reported dollar cost is zero.** Token usage is recorded separately; see
+  [At a glance](#at-a-glance).
 
 ## Not yet exercised
 
@@ -281,9 +318,13 @@ agents:
 
 ## Troubleshooting
 
-**``codex preflight: `codex --version` exited 127``, or `fullsend: codex not found on PATH`
-(exit 127) once the run starts.** The sandbox image predates the `CODEX_VERSION` pin, so there is no
-codex to run. Pull a current `ghcr.io/fullsend-ai/fullsend-sandbox` image.
+**``codex preflight: `codex --version` exited 127``, or
+`fullsend: codex not found in a PATH directory the agent cannot write` (exit
+127) once the run starts.** The sandbox image predates the `CODEX_VERSION` pin,
+so there is no codex to run. Pull a current
+`ghcr.io/fullsend-ai/fullsend-sandbox` image. A custom image fails the same way
+when its `codex` is found only through a directory the sandbox user owns or can
+write. Install it, and `node`, outside such directories.
 
 **Denied requests in the sandbox egress log at startup.** Expected noise, not failures. Codex
 probes on the way up and the policy refuses what the run does not need:
@@ -347,6 +388,45 @@ The first two exit 97 and mean the hook wiring cannot be trusted; the third exit
 credential-and-trust guard. All three are fail-closed by design. Between iterations the agent runs
 as the same user as those files, so "did the agent write there?" is the question to ask first.
 
+**A spawn failed the admission check.** After an iteration whose `exec --json` stream reported a
+completed `spawn_agent`, the runner compares the run's completed spawns with the spawn guard's
+`codex_spawn_guard_admit` lines in `/sandbox/workspace/.security/findings.jsonl`, and the run fails
+whatever codex's exit code. Each message says why:
+
+```
+codex_spawn_without_admission: 3 completed spawn(s) in this run's stream(s) but 2 recorded admission(s)
+```
+The guard admitted fewer spawns than completed: a hook handler that timed out or failed let a spawn
+through, or the findings log lost lines. The count spans every iteration of the run, so a retry's
+spawns need admissions of their own. Ask first whether the agent wrote to the findings log; a log
+over 1 MiB is read cut, and the message then ends with `the admissions read was cut at 1048576
+bytes`.
+```
+codex_spawn_without_admission: a completed spawn was not sent by the primary thread
+```
+A spawn item without a sender, or sent by a thread other than the run's own. Codex 0.159.3 emits
+neither; look for a malformed or planted stream line.
+```
+codex_spawn_without_admission: a spawn_agent item longer than 1048576 bytes could not be read
+```
+The parent spawned with a prompt over 1 MiB, so the runner cannot tell whether that spawn
+completed. Shorten the prompt.
+```
+reading the spawn admissions: ...
+```
+The findings log could not be read (the command failed or timed out), so the check could not be
+made.
+
+**`codex dropped N stream notification(s) under backpressure; the progress log is incomplete`.**
+A warning: codex's in-process channel filled and it dropped an item notification, which it says on
+stderr; the runner reads codex's stderr for that line on every run (under `--debug` the sandbox log
+instead). A dropped completed item comes back when the turn completes, if exec's read of the turn's
+items succeeds; when that read fails codex says so too, and the warning adds `and its backfill of
+the turn's items failed`. A spawn that lost both its notifications, or whose backfill failed, is
+not counted, and the count cannot tell those from a harmless drop. The launch sets `RUST_LOG`
+itself, codex's default filter with `codex_exec` and `codex_app_server::in_process` at warn (`info`
+under `--debug`), replacing any value from the environment or `.env`.
+
 **`--debug "..."` fails with `accepts 1 arg(s)`.** `--debug` takes an optional value: write
 `--debug='*'` (with `=`).
 
@@ -363,7 +443,7 @@ to finish the job. The credential is dead either way; run that command to tidy u
 references the provider.
 
 **The agent fails with nothing in the terminal.** Codex has no debug flag of its own, so
-`--debug='*'` makes the runner export `RUST_LOG` and capture codex's stderr to `codex-debug.log` in
+`--debug='*'` makes the runner set `RUST_LOG=info` and capture codex's stderr to `codex-debug.log` in
 the run directory, next to the transcripts. Kept sandboxes must be removed manually
 (`openshell sandbox delete <name>`).
 

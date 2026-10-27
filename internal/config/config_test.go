@@ -422,9 +422,22 @@ create_issues:
 func TestNewPerRepoConfig_CreateIssuesDefaults(t *testing.T) {
 	cfg := NewPerRepoConfig(nil, "my-org/my-repo")
 	require.NotNil(t, cfg.IssueCreationConfig())
-	// The target repo is implicitly allowed; only the upstream entry is
-	// materialized.
-	assert.Equal(t, []string{"fullsend-ai/fullsend"}, cfg.IssueCreationConfig().AllowTargets.Repos)
+	// The target repo is implicitly allowed; both upstream destinations
+	// are materialized.
+	want := []string{"fullsend-ai/fullsend", "fullsend-ai/agents"}
+	assert.Equal(t, want, cfg.IssueCreationConfig().AllowTargets.Repos)
+	data, err := yaml.Marshal(cfg)
+	require.NoError(t, err)
+	parsed, err := ParsePerRepoConfig(data)
+	require.NoError(t, err)
+	assert.Equal(t, want, parsed.IssueCreationConfig().AllowTargets.Repos)
+}
+
+func TestNewPerRepoConfig_CreateIssuesDefaultsAreIndependent(t *testing.T) {
+	first := NewPerRepoConfig(nil, "acme/one")
+	second := NewPerRepoConfig(nil, "acme/two")
+	first.IssueCreationConfig().AllowTargets.Repos[0] = "acme/custom"
+	assert.Equal(t, []string{"fullsend-ai/fullsend", "fullsend-ai/agents"}, second.IssueCreationConfig().AllowTargets.Repos)
 }
 
 // --- AgentEntry tests ---
@@ -538,6 +551,38 @@ type agentEntriesValidator struct {
 
 func (v agentEntriesValidator) Validate() error {
 	return ValidateAgentEntries(v.agents, v.allowlist)
+}
+
+func TestValidateAgentEntries_Trigger(t *testing.T) {
+	// A trigger alone makes a valid override-only entry for a built-in agent.
+	require.NoError(t, ValidateAgentEntries([]AgentEntry{{Name: "review", Trigger: `event.transition.kind == "opened"`}}, nil))
+	assert.True(t, AgentEntry{Name: "review", Trigger: "true"}.IsOverrideOnly())
+
+	err := ValidateAgentEntries([]AgentEntry{{Name: "review", Trigger: `event.transition.kind ==`}}, nil)
+	require.ErrorContains(t, err, "agents[0] (review): invalid trigger")
+
+	err = ValidateAgentEntries([]AgentEntry{{Name: "review", Trigger: `"opened"`}}, nil)
+	require.ErrorContains(t, err, "must evaluate to bool")
+
+	err = ValidateAgentEntries([]AgentEntry{{Source: "harness/lint.yaml", Trigger: `event.x ==`}}, nil)
+	require.ErrorContains(t, err, "agents[0] (harness/lint.yaml): invalid trigger")
+}
+
+func TestPerRepoConfigValidate_RejectsInvalidAgentTrigger(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("version: \"1\"\nagents:\n  - name: review\n    trigger: event.transition.kind ==\n"), 0o644))
+	cfg, err := LoadConfigWriter(dir, LoadOpts{})
+	require.NoError(t, err, "agent entries are validated by Validate and their consumers, not at load")
+	require.ErrorContains(t, cfg.Validate(), "invalid trigger")
+}
+
+func TestAgentEntry_TriggerYAMLRoundTrip(t *testing.T) {
+	var e AgentEntry
+	require.NoError(t, yaml.Unmarshal([]byte("name: review\ntrigger: |\n  event.transition.kind == \"opened\"\n"), &e))
+	assert.Equal(t, "event.transition.kind == \"opened\"\n", e.Trigger)
+	out, err := yaml.Marshal(e)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), "trigger:")
 }
 
 func TestValidateAgentEntries_Valid(t *testing.T) {

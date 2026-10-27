@@ -120,6 +120,9 @@ type PollerGenerationState struct {
 
 // maxAbandonedPollerGenerations bounds the abandoned replacement accounts kept
 // before further generations are refused until an operator reconciles them.
+// Together with the single old/new pair that pollerHandoffBlocked and
+// beginPollerCutover enforce, it is the GitLab Free-tier quota for Poller
+// generation accounts (see gitlab_poller_retirement.go).
 const maxAbandonedPollerGenerations = 3
 
 type pollerGenerationEnvelope struct {
@@ -323,7 +326,7 @@ func pollerHandoffBlocked(st PollerGenerationState) string {
 		return fmt.Sprintf("webhook fast-path blocked: %d replacement GitLab Poller accounts were abandoned after their trigger publication failed (user IDs %v), so no further replacement is started. Delete those accounts, then remove abandoned_user_ids from %s. The polling schedules remain in effect", len(st.AbandonedUserIDs), st.AbandonedUserIDs, forge.VarGitLabPollerGenerations)
 	}
 	if st.RetiringUserID != 0 {
-		return fmt.Sprintf("webhook fast-path blocked: the superseded GitLab Poller identity (user ID %d) has not finished retiring, so no replacement Poller generation is started. The polling schedules remain in effect", st.RetiringUserID)
+		return fmt.Sprintf("webhook fast-path blocked: the superseded GitLab Poller identity (user ID %d) has not finished retiring, so no replacement Poller generation is started (at most one old/new Poller pair exists); install retires it once its rotation grace has elapsed and no unfinished job runs as it. The polling schedules remain in effect", st.RetiringUserID)
 	}
 	p := st.Pending
 	if p == nil {
@@ -356,8 +359,9 @@ func beginPollerCutover(st PollerGenerationState, newUserID int64) (PollerGenera
 }
 
 // finishPollerRetirement clears the retiring Poller once its schedules,
-// credentials, triggers, and account were removed. retiredUserID must match
-// the recorded retiring account.
+// credentials, triggers, and account were removed
+// (retireSupersededPollerGeneration). retiredUserID must match the recorded
+// retiring account.
 func finishPollerRetirement(st PollerGenerationState, retiredUserID int64) (PollerGenerationState, error) {
 	if retiredUserID <= 0 || st.RetiringUserID != retiredUserID {
 		return st, fmt.Errorf("GitLab Poller retirement refused: user ID %d is not the recorded retiring Poller", retiredUserID)
@@ -655,6 +659,19 @@ func (g *pollerGenerationRun) revokeTrigger(id int64) error {
 	return nil
 }
 
+// pollerTriggerRequestUnknown reports whether an interrupted generation's
+// single trigger-create request may have been sent, so recovery quarantines it
+// instead of resuming.
+func pollerTriggerRequestUnknown(p PendingPollerGeneration) bool {
+	return p.TriggerAttempted || p.Phase == PollerPhaseTriggerRequested
+}
+
+// pollerTriggerUnknownReason is the quarantine reason for a generation whose
+// trigger creation request has an unknown result.
+func pollerTriggerUnknownReason(userID int64) string {
+	return fmt.Sprintf("its single pipeline trigger creation request has an unknown result and is never retried; delete any %q pipeline trigger owned by user ID %d, remove the account, then %s", GitLabWebhookTriggerDescription, userID, pollerClearPendingAction)
+}
+
 // recoverInterrupted returns a generation left elevated by an interrupted run
 // to Developer. A generation that never sent its trigger request resumes;
 // one whose request may be in flight is quarantined.
@@ -665,8 +682,8 @@ func (g *pollerGenerationRun) recoverInterrupted() (res PollerHandoffResult, sto
 		return res, true, errors.Join(fmt.Errorf("recovering the replacement GitLab Poller generation (user ID %d): %w", p.UserID, demoteErr), writeErr)
 	}
 	g.details = append(g.details, fmt.Sprintf("Returned the interrupted replacement GitLab Poller generation (user ID %d) to verified Developer access", p.UserID))
-	if p.TriggerAttempted || p.Phase == PollerPhaseTriggerRequested {
-		res, err := g.quarantine(fmt.Sprintf("its single pipeline trigger creation request has an unknown result and is never retried; delete any %q pipeline trigger owned by user ID %d, remove the account, then %s", GitLabWebhookTriggerDescription, p.UserID, pollerClearPendingAction))
+	if pollerTriggerRequestUnknown(p) {
+		res, err := g.quarantine(pollerTriggerUnknownReason(p.UserID))
 		return res, true, err
 	}
 	p.Phase = PollerPhaseAccountRecorded

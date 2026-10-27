@@ -333,7 +333,10 @@ func TestBuildOpenCodeRunCommand(t *testing.T) {
 	cmd := buildOpenCodeRunCommand(params, "triage", trustedEnv)
 
 	assert.Contains(t, cmd, "cd "+shellQuote(params.RepoDir))
-	assert.Contains(t, cmd, "&& . "+shellQuote(sandbox.SandboxWorkspace+"/.env"))
+	// .env is read as data, never sourced (#8574).
+	assert.Contains(t, cmd, "&& "+openCodeEnvLoad)
+	assert.NotContains(t, cmd, ". "+shellQuote(sandbox.SandboxWorkspace+"/.env"))
+	assert.NotContains(t, cmd, ". "+sandbox.SandboxWorkspace+"/.env")
 	assert.Contains(t, cmd, "&& export "+openCodeRuntimeEnv+"=opencode")
 	// opencode runs inside the tee pipeline so its stream lands in a sandbox
 	// transcript file for ExtractTranscripts while still streaming to the host.
@@ -361,8 +364,9 @@ func TestBuildOpenCodeRunCommand(t *testing.T) {
 	configPath := OpenCodeRuntime{}.ConfigDir() + "/" + openCodeConfigFile
 	assert.Contains(t, cmd, "> "+shellQuote(configPath))
 	assert.Contains(t, cmd, shellQuote(openCodeInstructionsConfig(params.RepoDir)))
-	envIdx := strings.Index(cmd, "&& . "+shellQuote(sandbox.SandboxWorkspace+"/.env"))
-	require.NotEqual(t, -1, envIdx, ".env source must be present")
+	assert.Contains(t, cmd, `"$`+openCodePrintfVar+`" '%s' `+shellQuote(openCodeInstructionsConfig(params.RepoDir)))
+	envIdx := strings.Index(cmd, "&& "+openCodeEnvLoad)
+	require.NotEqual(t, -1, envIdx, ".env data loader must be present")
 	unsetIdx := strings.Index(cmd, "&& "+openCodeHookFunctionsUnset)
 	require.NotEqual(t, -1, unsetIdx, "shell functions must be unset after .env")
 	assert.Greater(t, unsetIdx, envIdx, "shell functions must be unset after .env")
@@ -375,27 +379,98 @@ func TestBuildOpenCodeRunCommand(t *testing.T) {
 	assert.Less(t, strings.Index(cmd, openCodePathPinVar+`="$PATH"`), envIdx, "PATH pin must appear before .env")
 	assert.Greater(t, strings.Index(cmd, "&& "+openCodeTrustedEnvRestore()), envIdx, "trusted values must be restored after .env")
 	// EnvExports re-pin (OPENCODE_CONFIG_DIR, OPENCODE_DISABLE_PROJECT_CONFIG) must
-	// appear after .env sourcing — a hostile .env could otherwise redirect config
+	// appear after the .env data load — a hostile .env could otherwise redirect config
 	// discovery or re-enable the workspace config walk.
 	for _, envExport := range (OpenCodeRuntime{}).EnvExports() {
 		exportIdx := strings.Index(cmd, "&& "+envExport)
 		require.NotEqual(t, -1, exportIdx, "EnvExports entry %q must be present", envExport)
-		assert.Greater(t, exportIdx, envIdx, "EnvExports entry %q must appear after .env sourcing", envExport)
+		assert.Greater(t, exportIdx, envIdx, "EnvExports entry %q must appear after the .env data load", envExport)
 	}
 }
 
 func TestOpenCodeBinaryPin(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not available")
+	}
 	bin := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(bin, "opencode"), []byte("#!/bin/sh\necho REAL\n"), 0o755))
 	envFile := filepath.Join(t.TempDir(), ".env")
-	require.NoError(t, os.WriteFile(envFile, []byte("opencode() { echo FAKE; }\nexport PATH=/nonexistent\n"), 0o644))
+	require.NoError(t, os.WriteFile(envFile, []byte("opencode() { echo FAKE; }\nexport "+openCodeBinaryVar+"=/evil\nexport PATH=/nonexistent\n"), 0o644))
 
-	pin := strings.ReplaceAll(openCodeBinaryPin(), shellQuote(openCodeBinaryPath), shellQuote(filepath.Join(bin, "opencode")))
-	cmd := exec.Command("sh", "-c", pin+" && . "+shellQuote(envFile)+` && command "$`+openCodeBinaryVar+`"`)
+	cmd := exec.Command("sh", "-c", protectedDirsShell(t, bin)+openCodeBinaryPin()+" && "+envDataLoad(envFile, openCodeEnvDataDrop...)+" && "+cliLaunch(openCodeBinaryVar, openCodeNodeVar))
 	cmd.Env = []string{"PATH=" + bin + ":/usr/bin:/bin"}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "%s", out)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	require.NoError(t, err, "%s", stderr.String())
 	assert.Equal(t, "REAL", strings.TrimSpace(string(out)))
+	assert.Contains(t, stderr.String(), openCodeBinaryVar+" is not taken from .env")
+}
+
+// The proposed test from #8574: the OpenCode launch reads a hostile .env and
+// .env.d file as data. No construct runs, LD_* never reaches opencode, plain
+// exports still apply, assignments to the read-only pins are dropped rather
+// than aborting the launch, and the pinned binary starts.
+func TestOpenCodeLaunch_HostileEnvDoesNotExecute(t *testing.T) {
+	requirePinnedSha256sum(t)
+	f := newEnvDataFixture(t)
+	bin := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(bin, "opencode"), []byte("#!/bin/sh\necho REAL\nenv\n"), 0o755))
+	marker := filepath.Join(f.ws, "pwned")
+	hostile := strings.Join([]string{
+		"export SUB=$(touch " + marker + ")",
+		"export TICK=`touch " + marker + "`",
+		"opencode() { touch " + marker + "; }",
+		"touch " + marker,
+		"exec /bin/true",
+		"export LD_PRELOAD=/tmp/evil.so",
+		"export LD_LIBRARY_PATH=/tmp/evil",
+		"export LD_AUDIT=/tmp/evil.so",
+		"export " + openCodeBinaryVar + "=/bin/true",
+		"export " + openCodePathPinVar + "=/evil",
+		"export PATH=/sandbox/workspace/bin:$PATH",
+	}, "\n") + "\n"
+	control := envDataControlLines(f.ws)
+	f.write(t, ".env", hostile+"export KEPT=ok\n"+strings.Join(control, "\n")+"\n")
+	f.write(t, ".env.d/harness.env", hostile+"export FROM_ENVD=yes\n")
+
+	trusted := openCodeTrustedEnv{ConfigContent: `{"permission":{"*":"deny"}}`, CredentialsPath: "/runner/adc.json"}
+	script := strings.Join([]string{
+		openCodeBinaryPin(),
+		openCodeUtilityPin(),
+		openCodeTrustedEnvPin(trusted),
+		envDataLoadWith(f.envFile, control, openCodeEnvDataDrop),
+		strings.Join(OpenCodeRuntime{}.EnvExports(), " && "),
+		openCodeTrustedEnvRestore(),
+		cliLaunch(openCodeBinaryVar, openCodeNodeVar),
+	}, " && ")
+	cmd := exec.Command("/bin/sh", "-c", protectedDirsShell(t, bin)+script)
+	cmd.Env = []string{"PATH=" + bin + ":/usr/bin:/bin", "HOME=/home/agent"}
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	require.NoError(t, err, stderr.String())
+
+	assert.NoFileExists(t, marker, "a construct from .env or .env.d ran")
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	require.NotEmpty(t, lines)
+	assert.Equal(t, "REAL", lines[0], "the pinned opencode starts")
+	env := map[string]string{}
+	for _, kv := range lines[1:] {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			env[k] = v
+		}
+	}
+	for _, name := range []string{"LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "SUB", "TICK"} {
+		_, ok := env[name]
+		assert.False(t, ok, "%s reached opencode", name)
+	}
+	assert.Equal(t, "ok", env["KEPT"], "plain exports from .env still apply")
+	assert.Equal(t, "yes", env["FROM_ENVD"], "plain exports from .env.d still apply")
+	assert.Equal(t, bin+":/usr/bin:/bin", env["PATH"], "PATH is restored to the pre-.env pin")
+	assert.NotContains(t, stderr.String(), marker, "dropped lines are reported by number, not content")
+	assert.Contains(t, stderr.String(), "harness.env")
+	assert.Contains(t, stderr.String(), openCodePathPinVar+" is not taken from .env")
 }
 
 func TestOpenCodeCloudLocationExport(t *testing.T) {
@@ -457,7 +532,12 @@ func TestOpenCodeHooksGuardUsesUnshadowableCommands(t *testing.T) {
 	assert.Equal(t, openCodeHooksMissingExit, exitErr.ExitCode())
 }
 
+// The restore is the second layer behind reading .env as data: what .env
+// may still assign (plain exports) is put back or cleared after it.
 func TestOpenCodeTrustedEnvRestore(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not available")
+	}
 	envFile := filepath.Join(t.TempDir(), ".env")
 	require.NoError(t, os.WriteFile(envFile, []byte(
 		"export OPENCODE_CONFIG_CONTENT=evil\n"+
@@ -483,13 +563,15 @@ func TestOpenCodeTrustedEnvRestore(t *testing.T) {
 	// Set a known HOME and PATH so the pin captures them.
 	command := "HOME=" + shellQuote(origHome) + " PATH=" + shellQuote(origPath) +
 		" sh -c " + shellQuote(
-		openCodeTrustedEnvPin(trustedEnv)+" && . "+shellQuote(envFile)+" && "+openCodeTrustedEnvRestore()+
+		openCodeTrustedEnvPin(trustedEnv)+" && "+envDataTrustedPin()+" && "+envDataLoad(envFile, openCodeEnvDataDrop...)+" && "+openCodeTrustedEnvRestore()+
 			` && printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' "$OPENCODE_CONFIG_CONTENT" "$GOOGLE_APPLICATION_CREDENTIALS" "$HOME" "$PATH" "$OPENCODE_PERMISSION" "$OPENCODE_CONFIG" "$LD_PRELOAD"`,
 	)
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "%s", out)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	require.NoError(t, err, "%s%s", out, stderr.String())
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	// Expect exactly 4 non-empty lines: CONFIG_CONTENT, GOOGLE_APPLICATION_CREDENTIALS,
 	// HOME, PATH. Dangerous vars (OPENCODE_PERMISSION, OPENCODE_CONFIG, LD_PRELOAD)
@@ -536,21 +618,36 @@ exit 0
 
 func TestOpenCodeTrustedEnvReadCommand(t *testing.T) {
 	requirePinnedSha256sum(t)
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("python3 not available")
+	}
 	want := openCodeTrustedEnv{
 		ConfigContent:   "{\"permission\":{\"bash\":\"allow\"},\"quote\":\"'\",\"line\":\"a\\nb\"}",
 		CredentialsPath: "/runner/path with spaces/adc.json",
 	}
-	envFile := filepath.Join(t.TempDir(), ".env")
-	content := "command() { printf forged; }\nprintf() { :; }\n" +
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "pwned")
+	envFile := filepath.Join(dir, ".env")
+	// .env is read as data (#8574): the function definitions and the
+	// command are dropped, and the assignment to a read-only pin cannot
+	// abort the read.
+	content := "command() { printf forged; }\nprintf() { :; }\ntouch " + marker + "\n" +
+		"export " + openCodePrintfVar + "=/bin/true\n" +
 		"export OPENCODE_CONFIG_CONTENT=" + shellQuote(want.ConfigContent) + "\n" +
 		"export GOOGLE_APPLICATION_CREDENTIALS=" + shellQuote(want.CredentialsPath) + "\n"
 	require.NoError(t, os.WriteFile(envFile, []byte(content), 0o644))
 
-	out, err := exec.Command("sh", "-c", openCodeTrustedEnvReadCommand(envFile)).CombinedOutput()
-	require.NoError(t, err, "%s", out)
+	cmd := exec.Command("sh", "-c", openCodeTrustedEnvReadCommand(envFile))
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	require.NoError(t, err, "%s", stderr.String())
 	got, err := parseOpenCodeTrustedEnv(string(out))
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
+	assert.NoFileExists(t, marker, "a construct from .env ran")
+	assert.NotContains(t, stderr.String(), marker, "dropped lines are reported by number, not content")
+	assert.Contains(t, stderr.String(), "line 3:")
 }
 
 func TestOpenCodeValidateTrustedEnv(t *testing.T) {
@@ -640,15 +737,15 @@ func TestBuildOpenCodeRunCommand_HooksGuard(t *testing.T) {
 		HooksSettingsPath: "enabled",
 	}
 	cmd := buildOpenCodeRunCommand(params, "fix", openCodeTrustedEnv{Hooks: openCodeHookPolicy(OpenCodeRuntime{}.ConfigDir()+"/hooks", "/sandbox/workspace", &piAgentDef{}, nil)})
-	// The sha256 fail-closed guard is emitted before and after .env is sourced.
+	// The sha256 fail-closed guard is emitted before and after .env is read.
 	firstGuardIdx := strings.Index(cmd, "refusing to run unhooked")
 	lastGuardIdx := strings.LastIndex(cmd, "refusing to run unhooked")
-	envIdx := strings.Index(cmd, "&& . "+shellQuote(sandbox.SandboxWorkspace+"/.env"))
+	envIdx := strings.Index(cmd, "&& "+openCodeEnvLoad)
 	require.NotEqual(t, -1, firstGuardIdx, "hooks guard must be present")
 	require.NotEqual(t, -1, envIdx)
 	assert.Equal(t, 2, strings.Count(cmd, "refusing to run unhooked"))
-	assert.Less(t, firstGuardIdx, envIdx, "integrity guard must run before .env is sourced")
-	assert.Greater(t, lastGuardIdx, envIdx, "integrity guard must run again after .env is sourced")
+	assert.Less(t, firstGuardIdx, envIdx, "integrity guard must run before .env is read")
+	assert.Greater(t, lastGuardIdx, envIdx, "integrity guard must run again after .env is read")
 	assert.Less(t, strings.Index(cmd, openCodeHookFunctionsUnset), lastGuardIdx, "shell functions must be unset before the second integrity guard")
 	assert.Contains(t, cmd, `"$`+openCodeSHA256Var+`"`)
 	assert.Contains(t, cmd, openCodeUtilityPin())
@@ -661,12 +758,18 @@ func TestBuildOpenCodeRunCommand_ResetsOverridesAfterEnv(t *testing.T) {
 
 	env := openCodeTrustedEnv{AgentPath: sandbox.SandboxOpenCodeConfig + "/agent/triage.md", AgentDefinition: "---\n{}\n---\nbody\n"}
 	cmd := buildOpenCodeRunCommand(RunParams{AgentBaseName: "triage", RepoDir: "/repo"}, "triage", env)
-	envIdx := strings.Index(cmd, "&& . "+shellQuote(sandbox.SandboxWorkspace+"/.env"))
+	envIdx := strings.Index(cmd, "&& "+openCodeEnvLoad)
+	resetIdx := strings.Index(cmd, `"$`+openCodeRmVar+`" -rf -- `+OpenCodeRuntime{}.openCodeOverridePaths(false))
+	require.NotEqual(t, -1, envIdx)
+	require.NotEqual(t, -1, resetIdx)
+	assert.Greater(t, resetIdx, envIdx, "overrides must be reset after .env")
 	guardIdx := strings.Index(cmd, openCodeAgentGuard(env.AgentPath, env.AgentDefinition))
 	require.NotEqual(t, -1, guardIdx)
 	assert.Greater(t, guardIdx, envIdx, "agent guard must run after .env")
 	configPath := OpenCodeRuntime{}.ConfigDir() + "/" + openCodeConfigFile
-	assert.Contains(t, cmd, "> "+shellQuote(configPath), "repo instructions must be restored after .env")
+	configIdx := strings.Index(cmd, "> "+shellQuote(configPath))
+	require.NotEqual(t, -1, configIdx, "repo instructions must be restored after .env")
+	assert.Greater(t, configIdx, resetIdx, "overrides must be cleared before repo instructions are restored")
 	assert.Less(t, guardIdx, strings.Index(cmd, " run --format json"), "agent is checked before opencode starts")
 	assert.NotContains(t, cmd, shellQuote(env.AgentDefinition), "the agent body is not inlined (openshell argument limit)")
 }

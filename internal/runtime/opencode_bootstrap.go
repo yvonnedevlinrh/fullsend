@@ -48,7 +48,7 @@ func (r OpenCodeRuntime) openCodeSkillsPath() string {
 }
 
 // openCodeHooksExtensionPath is the path of the sandbox hook plugin
-// adapter. Run verifies its SHA-256 before .env is sourced, fail-closed, like
+// adapter. Run verifies its SHA-256 before .env is read, fail-closed, like
 // pi's piHooksGuard.
 func (r OpenCodeRuntime) openCodeHooksExtensionPath() string {
 	return r.ConfigDir() + "/" + openCodePluginsDir + "/" + openCodeHooksExtensionFile

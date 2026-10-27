@@ -55,6 +55,8 @@ func TestOpenCodeBootstrapHookPlan(t *testing.T) {
 	assert.Equal(t, security.HookPlan(in.hooks), env.Hooks.Groups)
 	assert.Equal(t, OpenCodeRuntime{}.ConfigDir()+"/hooks", env.Hooks.Dir)
 	assert.Equal(t, "/sandbox", env.Hooks.ShellHome)
+	assert.Equal(t, "/usr/bin/python3", env.Hooks.Python)
+	assert.Equal(t, "/usr/bin:/bin", env.Hooks.Env["PATH"], "hooks must use the interpreter probe's trusted PATH")
 	log, err := os.ReadFile(filepath.Join(work, "log"))
 	require.NoError(t, err)
 	assert.Contains(t, string(log), "refusing to run unhooked")
@@ -68,7 +70,7 @@ func TestOpenCodeBootstrapHookPlan(t *testing.T) {
 }
 
 func TestOpenCodeBootstrapHookFailure(t *testing.T) {
-	for _, failure := range []string{"rm -rf -- '/sandbox/opencode-config/hooks'", "sys.version_info", "fullsend-env-sep", `printf '%s' "$HOME"`, "rm -rf -- '/sandbox/opencode-config/plugins'"} {
+	for _, failure := range []string{"rm -rf -- '/sandbox/opencode-config/hooks'", hookInterpreterSep, "sys.version_info", "fullsend-env-sep", `printf '%s' "$HOME"`, "rm -rf -- '/sandbox/opencode-config/plugins'"} {
 		t.Run(failure, func(t *testing.T) {
 			work := t.TempDir()
 			fakeOpenshellOpenCode(t, filepath.Join(work, "log"), filepath.Join(work, "store"))

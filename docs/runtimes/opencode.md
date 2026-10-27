@@ -130,10 +130,24 @@ example above.
   read regular files or file symlinks through that tool.
 - **The agent is reset before every iteration.** The runner removes agent, tool and config overrides
   from writable config locations, re-uploads the agent definition, and checks that OpenCode loads it.
-  Adapter/script digests are checked before agent verification and before and after `.env` is sourced.
+  Adapter/script digests are checked before agent verification and before and after `.env` is read.
   Each intercepted tool call rechecks the script directory. Native write/edit/patch tools cannot
   write outside the workspace or into `.env`, `.security` or `runner-state`, including via symlinks.
 - **Repo config is ignored.** OpenCode does not load the target repo's `.opencode/` config or skills.
+- **`.env` is read as data.** As on the other runtimes, the launch parses `.env` with a pinned
+  `python3` and runs none of it as shell, so the image needs `python3` and a regular-file `readlink`
+  in `PATH` directories the sandbox user neither owns nor can write. Without them the launch fails
+  with `python3 not found in a PATH directory the agent cannot write` (exit 127). The fullsend
+  sandbox image ships both.
+- **`opencode` comes from a directory the agent cannot write.** The launch pins
+  the first `opencode` in a `PATH` directory the sandbox user neither owns nor
+  can write, judged by the file it resolves to and every directory above that
+  file. An `opencode` found only through an agent-writable directory, or a
+  symlink into one, fails the launch with
+  `opencode not found in a PATH directory the agent cannot write` (exit 127).
+  If `opencode` is a `#!/usr/bin/env node` script rather than a binary, `node`
+  must sit in such a directory too, and the launch starts the script with it.
+  In the fullsend sandbox image `opencode` is a binary.
 
 The adapter is `plugins/fullsend-hooks.ts`, with selected scripts under `hooks/`,
 inside `/sandbox/opencode-config`. Hooks use the bootstrap-captured interpreter,
@@ -171,6 +185,9 @@ that installation after clearing user config, so startup needs no registry downl
 | `ProviderModelNotFoundError` | The id is not in OpenCode's built-in catalog. Use an id from the table above |
 | Vertex `404 NOT_FOUND` for the model | Your project does not serve it. Name one it serves |
 | `Falling back to default agent` | OpenCode could not load the agent, and the iteration fails. Rerun with `--debug='*'` and read `opencode-debug.log` |
+| `python3 not found in a PATH directory the agent cannot write` | The image has no `python3` outside directories the sandbox user owns or can write. Use the fullsend sandbox image or add one |
+| `no readlink that is a regular file in a PATH directory the agent cannot write`, then `opencode not found in a PATH directory the agent cannot write` | The image has no regular-file `readlink` outside those directories, so no binary can be pinned. Use the fullsend sandbox image or add coreutils `readlink` |
+| `opencode not found in a PATH directory the agent cannot write` | The image's `opencode` is missing, or is found only through a directory the sandbox user owns or can write. Install it outside such directories |
 | Tool calls fail with a permission error | The policy does not allow that tool (step 1) |
 
 ## See also

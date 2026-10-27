@@ -50,6 +50,7 @@ agents:                              # Registered agent sources and per-agent tu
     subagents:                       # Per-agent sub-agent model map
       default: sonnet                # Fallback model for personas without an explicit entry
       code-reviewer: opus            # Model for a specific persona
+    # trigger: <CEL expression>      # When the built-in review agent runs (review entry only)
 
 # ── Remote resources ─────────────────────────────────────────
 allowed_remote_resources:            # URL prefixes allowed for remote resources (agents, policies, skills, plugins, profiles, providers, and base composition)
@@ -63,6 +64,7 @@ create_issues:
       - my-org
     repos:                           # Specific repos (owner/name) agents may create issues in
       - fullsend-ai/fullsend
+      - fullsend-ai/agents
 
 # ── Authorization ────────────────────────────────────────────
 authorization:                       # Extra sources of slash-command permission, checked before the collaborator API
@@ -86,6 +88,8 @@ inference:
   project: my-gcp-project           # GCP project ID (must be provided by installer)
   region: global                     # GCP region for inference requests
   wif_provider: projects/123/locations/global/workloadIdentityPools/pool/providers/prov  # WIF provider resource name
+  wif_audience: ""                   # GitLab: agent job ID token audience for an existing provider (default "fullsend")
+  service_account: ""                # GitLab: service account email the agent job impersonates (default none)
   openai:                            # OpenAI Workload Identity Federation (ADR 0092)
     audience: ""                     # OpenAI WIF audience
     identity_provider_id: ""         # OpenAI WIF identity provider ID
@@ -172,7 +176,7 @@ Omitting the key inherits the parent's roles. See
 
 Registered agent sources and per-agent tuning. Each entry identifies an agent
 by source URL or local path, with optional overrides for runtime, model,
-effort, and sub-agent models.
+effort, sub-agent models and the trigger.
 
 - **`source`** — URL (must include `#sha256=<64-hex-char>` integrity hash) or
   local path. URL sources must be covered by `allowed_remote_resources`.
@@ -192,6 +196,23 @@ effort, and sub-agent models.
   key sets the fallback for personas without an explicit entry. A `~` (null)
   value tombstones an inherited entry. Keys must be lowercase alphanumeric
   segments joined by hyphens (max 64 chars).
+- **`trigger`** — A [CEL trigger](../guides/user/cel-triggers-reference.md)
+  (a boolean over the normalized `event`). It decides routing for the
+  built-in review, retro, triage and prioritize agents only: on one of those
+  entries it opts the repository into CEL routing for that agent, so the
+  trigger, not the dispatch workflow's built-in rules, decides when the
+  agent's job starts (see
+  [Choosing when review runs](../guides/user/customizing-agents.md#choosing-when-review-runs),
+  [Choosing when retro runs](../guides/user/customizing-agents.md#choosing-when-retro-runs)
+  and
+  [Choosing when triage and prioritize run](../guides/user/customizing-agents.md#choosing-when-triage-and-prioritize-run)).
+  It does not change CEL dispatch: the harness `trigger:` keeps deciding when
+  custom agents run and what the Jira poller dispatches. A trigger alone
+  makes a valid override-only entry for a built-in agent. Validated when the
+  agent list is validated: it must compile and return a boolean. Like an
+  invalid `model` or `effort`, an invalid `trigger` makes every agent run in
+  the repository fail with `invalid agent config`, not only built-in routing, so
+  check the expression before you merge the change.
 
 In the layered config system, agents use keyed merge by `DerivedName()` — see
 [Layered Config Reference](../guides/infrastructure/layered-config-reference.md).
@@ -224,9 +245,26 @@ restricts which orgs and repos agents may create issues in.
 
 When omitted, agents cannot create issues outside the repository they are
 running in. That repository is always allowed, so it does not need an
-entry. The default per-repo configuration generated without a preset lists
-only `fullsend-ai/fullsend` in `allow_targets.repos`, which lets retro file
-upstream proposals and triage file upstream prerequisites.
+entry. The default GitHub per-repo configuration generated without a preset lists
+both `fullsend-ai/fullsend` and `fullsend-ai/agents` in `allow_targets.repos`,
+so retro proposals and triage prerequisites can reach the platform or agent
+repository that owns the change. These are installation defaults, not an
+automatic grant for every repository in `allowed_remote_resources`.
+Fresh GitLab installations instead record an explicit empty `allow_targets`
+policy: cross-project targets must be configured for the GitLab host.
+Explicit settings are preserved. Retro and triage post-scripts currently read
+only the overlay (`.fullsend/config.yaml`), not the preset
+(`.fullsend/config.base.yaml`). Until
+[agents#1728](https://github.com/fullsend-ai/agents/issues/1728) is fixed,
+preset users must declare the required `config.create_issues.allow_targets` in the
+managed repository’s `repos.yaml` entry and rerun `fullsend repos install`,
+or edit `.fullsend/config.yaml` for an unmanaged installation. Updating only
+the preset does not enable these cross-repository operations. Include all
+targets the post-scripts need in the overlay policy.
+Existing installations retain their permissions on upgrade; on GitHub, to opt in, add
+`fullsend-ai/agents` to the existing target list in the managed repository’s
+`repos.yaml` configuration, or in `.fullsend/config.yaml` for an installation
+not managed through `fullsend repos`. Preserve any other targets you need.
 
 ### `authorization`
 
@@ -236,8 +274,9 @@ The only provider is `owners_file`:
 
 - An `approvers` entry in the repo-root `OWNERS` file gets write-level access
   (every slash command and custom agent). A `reviewers` entry gets
-  triage-level access, which covers `/fs-triage` and `/fs-review` only:
-  custom agents under `agents:` still require write.
+  triage-level access, which covers `/fs-triage`, `/fs-review`, and custom
+  agents whose harness sets `role: triage` or `role: review`. Custom agents
+  with any other `role:` still require write.
 - An entry that names a key in `OWNERS_ALIASES` stands for that alias's
   members. A GitHub login equal to any alias key never matches, and nested
   aliases are not expanded.
@@ -307,6 +346,25 @@ flag is an error). See
 - **`region`** — GCP region for inference. Default: `global`.
 - **`wif_provider`** — Full Workload Identity Federation provider resource
   name. No default — must be provided by the installer.
+- **`wif_audience`** — GitLab `vertex-wif` only. The audience the GitLab
+  agent job requests for its ID token (`FULLSEND_ID_TOKEN`), for an existing
+  WIF provider that does not accept `fullsend`. `fullsend repos install`
+  renders it into `.gitlab/ci/fullsend-agent.yml`. Default: unset, which
+  keeps `aud: "fullsend"`. Must be a single line of printable ASCII with no
+  surrounding spaces and no `$`.
+- **`service_account`** — GitLab `vertex-wif` only. The email of a service
+  account the agent job impersonates after the federated token exchange
+  (`<name>@<project>.iam.gserviceaccount.com`). `fullsend repos install`
+  writes it as the `FULLSEND_GCP_SERVICE_ACCOUNT` CI/CD variable. Default:
+  unset, which keeps direct federated identity.
+
+  Both keys require an explicitly supplied `wif_provider` (or
+  `--vertex-wif-provider`) and are read only at install time. In `repos.yaml`,
+  set them under `gitlab.config` or on `gitlab.repos` entries: `github.config`
+  and `github.repos` entries reject them, and values inherited from
+  `defaults.config` are ignored on GitHub repositories and on GitLab
+  repositories that do not use `vertex-wif`. See
+  [Using an existing WIF provider](../guides/getting-started/configuring-gitlab.md#using-an-existing-wif-provider).
 - **`openai`** — OpenAI Workload Identity Federation identifiers
   ([ADR 0092](../ADRs/0092-openai-wif-credential-delivery.md)). The
   `FULLSEND_OPENAI_*` runner variables, when set, replace the resolved block

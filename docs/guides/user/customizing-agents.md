@@ -114,6 +114,8 @@ validation_loop:
   schema: schemas/my-custom-schema.json
 ```
 
+Setting `validation_loop.preflight_check` swaps the dependency probe. It runs in a minimal, credential-safe environment, and an out-of-scope `${VAR}` reference fails the run before the probe executes. See the [harness reference](../../reference/harness-reference.md) for the full contract.
+
 ### What you can override
 
 Any harness field can be overridden. See the [field merge rules](../../reference/harness-reference.md#field-merge-rules-for-base-and-overlays) for how each field type combines with the base:
@@ -370,9 +372,9 @@ also need the Go toolchain. Pin the parent tag to a digest before CI use.
 On Claude and pi runs the sandbox already has `/sandbox/workspace/bin` on its
 `PATH`, after the image's own directories. A file there adds a command; it
 does not replace a command the image already provides, such as `git`,
-`python3` or `node`. Codex runs restore the `PATH` from before the workspace
-`.env` is sourced, so `/sandbox/workspace/bin` is not on the codex agent's
-`PATH`; call the script by its absolute path there. To make a script
+`python3` or `node`. Codex and OpenCode runs restore the `PATH` from before
+the workspace `.env` is read, so `/sandbox/workspace/bin` is not on the codex
+or OpenCode agent's `PATH`; call the script by its absolute path there. To make a script
 available as a command on Claude and pi runs, drop it there:
 
 1. Create your script (e.g. `scripts/my-tool.sh`):
@@ -427,24 +429,166 @@ When you need a directory outside `/sandbox/workspace/bin` on the `PATH`
        dest: /sandbox/workspace/.env.d/extra-path.env
    ```
 
-3. At startup the sandbox sources every `*.env` file under
-   `/sandbox/workspace/.env.d/`, picking up your PATH addition.
+3. At startup the sandbox reads every `*.env` file under
+   `/sandbox/workspace/.env.d/`, picking up your PATH addition. Claude, codex,
+   pi and OpenCode launches read these files as data, not shell: write plain
+   `export NAME=value` lines, one assignment per line and without
+   `${NAME:-default}` (see
+   [`.env.d` host files](../../reference/harness-reference.md)).
 
-On Claude and pi runs, after the `.env.d` files are sourced, the runner puts
+On Claude and pi runs, after the `.env.d` files are read, the runner puts
 its own `PATH` back in front, so your directory ends up after the runner's
 entries: a command found only in `/opt/my-toolchain/bin` is picked up from
 there, and a command the image also provides, such as `git` or `go`, is
 picked up from the image. To replace one of those, extend the sandbox image
-(see [Extending the sandbox image](#extending-the-sandbox-image)). Codex runs
-restore the `PATH` from before `.env`, so `.env.d` additions are not on the
-codex agent's `PATH`.
+(see [Extending the sandbox image](#extending-the-sandbox-image)). Codex and
+OpenCode runs restore the `PATH` from before `.env`, so `.env.d` additions are
+not on the codex or OpenCode agent's `PATH`.
 
-`.env.d` files run as shell in the agent launch shell; treat them like
-`pre_script`. `host_files` can also place configuration that tools load, such
+Launches and the runner's probes read `.env.d` files as data, and shell
+constructs in them (command substitution, `;`-joined commands, `${NAME:-default}`
+and other lines that are not plain assignments) are skipped with a warning.
+`.env` itself is still valid shell that an agent may source, so keep treating
+these files like `pre_script`. `host_files` can also place configuration that tools load, such
 as git config or shell rc files; that is trusted like `pre_script` too.
 
-**Note**: `env.sandbox` cannot modify `PATH`, the harness ignores special
-variables to protect sandbox operation.
+#### Reserved `env.sandbox` names
+
+**Note**: `env.sandbox` cannot modify runner infrastructure or security
+settings through the reserved names below. The runner drops these names
+before writing the sandbox environment, case-insensitively:
+
+- **Runner infrastructure and process-loading safeguards:** `PATH`, `HOME`,
+  `SHELL`, `BASH_ENV`, `ENV`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `TRACEPARENT`,
+  and every `FULLSEND_*` variable the runner itself exports into the sandbox
+  (its output and fetch plumbing, the repository path, role and slug, the
+  iteration budget and deadline, and its own `PATH` entry). The set grows
+  with the runner; the warnings described below name any such key a harness
+  sets.
+- **Credentials it mints or receives:** `FULLSEND_GCP_OIDC_AUTH_FILE`,
+  `FULLSEND_TRIGGER_TOKEN`, `FULLSEND_GITLAB_TRIGGER_ACCOUNT_TOKEN`,
+  `FULLSEND_WEBHOOK_SECRET`, `FULLSEND_INFERENCE_GATEWAY_API_KEY`,
+  `FULLSEND_OPENAI_API_KEY`, `OPENAI_API_KEY`, `GH_WORKFLOW_TOKEN`, the
+  runner-secret bundle and its staging path (`FULLSEND_GITHUB_RUNNER_SECRETS`,
+  `FULLSEND_GITHUB_RUNNER_SECRETS_FILE`), and the GitHub Actions OpenID Connect
+  (OIDC) request pair `ACTIONS_ID_TOKEN_REQUEST_URL` /
+  `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. The runner uses this pair to request a
+  token proving the job's identity.
+- **Non-secret, runner-only inputs that select those credentials:**
+  `FULLSEND_GCP_OIDC_URL`, `FULLSEND_GCP_PROJECT_ID`,
+  `FULLSEND_GCP_WIF_PROVIDER`, `FULLSEND_OPENAI_AUDIENCE`,
+  `FULLSEND_OPENAI_IDENTITY_PROVIDER_ID`,
+  `FULLSEND_OPENAI_SERVICE_ACCOUNT_ID`.
+- **Security-sensitive names also refused in URL-sourced provider credential
+  definitions:** proxy settings (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`,
+  `ALL_PROXY`), Transport Layer Security (TLS) trust settings that select
+  certificates for verifying encrypted connections (`SSL_CERT_FILE`,
+  `SSL_CERT_DIR`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`), git configuration
+  (`GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GIT_EXEC_PATH`, `GIT_ASKPASS`,
+  `GIT_TEMPLATE_DIR`), interpreter injection (`NODE_OPTIONS`, `PYTHONPATH`,
+  `PYTHONSTARTUP`, `JAVA_TOOL_OPTIONS`, `RUBYOPT`, `PERL5OPT`),
+  dynamic-linker hooks (`LD_AUDIT`, `DYLD_INSERT_LIBRARIES`), shell behavior
+  (`IFS`, `CDPATH`, `PROMPT_COMMAND`) and the resolver alias file
+  (`HOSTALIASES`).
+
+The list is by name, not by namespace: harness-supplied hook inputs such as
+`FULLSEND_CANARY_TOKEN` and `FULLSEND_TOOL_ALLOWLIST` are still delivered
+through `env.sandbox` — see
+[Runtime Implementation](../../contributing/runtime-implementation.md).
+Matching is case-insensitive, so `https_proxy` is dropped exactly as
+`HTTPS_PROXY` is.
+
+This deny-list covers selected names, not every variable that can affect
+network routing, certificate trust, Git or interpreter behavior. An unlisted
+name is not necessarily safe.
+
+`fullsend run` warns when the harness loads, naming all reserved keys it will
+drop, and warns again on stderr for each key as it writes the sandbox
+environment. To check the harness without starting an agent:
+
+1. Run `fullsend lock <agent-name>`. It reports the same lint warning when it
+   loads and composes the harness. Locking may fetch dependencies and write the
+   lock file. If the entry is already current, it skips composition and does
+   not check the keys. `lock` composes without event context, so a key added
+   by an overlay guarded on `event` is reported only by `fullsend run`.
+2. Run `fullsend lock <agent-name> --update` (or
+   `fullsend lock --all --update`) to check the composed harness when the entry
+   is current. This forces dependency re-resolution and may change the lock
+   file; it is not a diagnostics-only operation.
+
+No key-specific warning on a cache hit means the keys were not checked, not
+that they are allowed.
+
+A key must start with an ASCII letter or underscore, followed only by ASCII
+letters, digits or underscores. `fullsend run` skips invalid names and warns
+on stderr; this separate identifier check is not reported by `fullsend lock`.
+Dropping a key removes that one `env.sandbox` export; it does not unset a value
+that reaches the sandbox another way, as `host_files` `.env.d` does.
+
+This gate covers `env.sandbox` only. `host_files` `.env.d` files are read
+before the runtime starts: every launch and the runner's in-sandbox probes
+read them as data and take only assignment lines, and never take the
+dynamic-loader, interpreter and shell-startup variables that the
+[`.env.d` host files](../../reference/harness-reference.md#field-details)
+entry in the harness reference lists. `.env` itself is still valid shell that
+an agent may source, so keep treating these files like `pre_script`. Either
+way, `.env.d` is not a general migration path for blocked proxy or
+certificate settings; the harness reference entry has the per-runtime
+rules.
+
+#### Migrating proxy and certificate settings
+
+Coordinate these changes with the operator of your OpenShell gateway:
+
+- **Corporate proxies:** use the operator-managed outbound-network settings
+  for the OpenShell version and compute driver you deploy; fullsend records
+  the version it pins in
+  [`.github/scripts/openshell-version.sh`](https://github.com/fullsend-ai/fullsend/blob/main/.github/scripts/openshell-version.sh)
+  at your release tag.
+  The [OpenShell gateway configuration reference](https://github.com/NVIDIA/OpenShell/blob/v0.1.4/docs/how-it-works/gateways/configuration.mdx)
+  for that version describes proxy chaining for policy-approved TLS
+  connections using the HTTP CONNECT method to establish a tunnel. Plain-HTTP
+  destination traffic remains direct. These are not fullsend harness fields or
+  a general replacement for every `HTTP_PROXY` or `ALL_PROXY` use. Do not
+  reintroduce application proxy exports through `.env.d` as a workaround.
+  **GitHub Action limitation:** fullsend's own GitHub Action writes
+  `gateway.toml` with a fixed template and has no input for upstream proxy or
+  CA settings. Self-hosted Actions runners behind a corporate proxy that relied
+  on `HTTPS_PROXY` in `env.sandbox` have no configuration step available yet.
+  This is tracked as a follow-up for an Action proxy input
+  ([#8505](https://github.com/fullsend-ai/fullsend/issues/8505)).
+- **Additional certificate authorities (CAs):** preserve the active sandbox's
+  OpenShell CA certificate and other required roots in application trust.
+  OpenShell's supervisor also verifies upstream TLS separately. Follow the
+  selected driver's certificate-provisioning instructions in that reference,
+  which documents `proxy_ca_bundle` for a corporate proxy. It requires
+  `https_proxy`, and on Kubernetes it is a path in the gateway Pod mounted
+  from a ConfigMap, not a host path. Do not assume that replacing a
+  generated bundle with a custom-only file, or changing only the agent
+  image's trust store, configures both trust paths. Have the gateway operator
+  validate the required application and supervisor connections before
+  deployment. The linked tag is what the pinned gateway supports; a setting
+  documented only at a later OpenShell tag is not available until fullsend
+  bumps the pin. If the linked tag does not document `additional_ca_bundle`
+  (added in OpenShell 0.1.5, for Podman gateways), a private CA used without
+  a corporate proxy has no gateway-level replacement for `SSL_CERT_FILE` or
+  `NODE_EXTRA_CA_CERTS` at that version.
+- **Git settings:** place git configuration with `host_files` (a git config
+  file or shell rc file the tools load) or use the tool's own configuration,
+  instead of `GIT_SSH_COMMAND`, `GIT_CONFIG_GLOBAL`, `GIT_ASKPASS` and the
+  other blocked `GIT_*` names. `host_files` content is trusted like
+  `pre_script`. Git and TLS equivalents the list does not yet cover, such as
+  `GIT_SSH`, `GIT_CONFIG_*` and `REQUESTS_CA_BUNDLE`, are tracked in
+  [#8503](https://github.com/fullsend-ai/fullsend/issues/8503).
+- **Interpreter, loader and shell names:** `NODE_OPTIONS`, `PYTHONPATH`,
+  `JAVA_TOOL_OPTIONS`, `LD_AUDIT`, `IFS` and the other blocked names of this
+  class have no supported replacement route into the sandbox. They are
+  blocked because they change how code is loaded or run. Which of them
+  `host_files` `.env.d` still delivers differs by runtime; the
+  [`.env.d` host files](../../reference/harness-reference.md#field-details)
+  entry lists what each runtime drops or unsets. Whatever it delivers, it
+  does so only because that file is trusted like `pre_script`, so it is not
+  a sanctioned way to restore them.
 
 ### Adding a skill
 
@@ -587,16 +731,454 @@ role name. The built-in agent names are: `code`, `triage`, `review`,
 agent named `code` — writing `name: coder` passes validation but
 disables nothing because no agent has that harness name.
 
+## Choosing when review runs
+
+By default, the dispatch workflow decides when the review agent runs: when a
+pull request is opened, pushed to or marked ready, when the
+`ready-for-review` label is added, and on a `/fs-review` comment. To decide it
+yourself, give the `review` entry in `.fullsend/config.yaml` a `trigger`: a
+[CEL expression](cel-triggers-reference.md) over the event. The review still
+runs in the same `Review` job; the trigger only decides whether that job
+starts.
+
+### Example: review only on `/fs-review`
+
+To stop the automatic review on every pull request but keep `/fs-review`, add
+this entry to `.fullsend/config.yaml` on your default branch:
+
+```yaml
+agents:
+  - name: review
+    trigger: >-
+      event.transition.kind == "comment_added"
+      && has(event.entity.linked_change_proposal)
+      && has(event.transition.comment.command)
+      && event.transition.comment.command == "/fs-review"
+      && event.actor.kind == "human"
+```
+
+`has(event.entity.linked_change_proposal)` keeps the trigger to comments on
+pull requests. The `Route` job evaluates the review trigger for the events
+the fullsend workflow receives: a pull request opened, pushed to
+(`synchronize`), marked ready for review, labeled or unlabeled, and a `/fs-*`
+comment on a pull request from a user who is not a bot. It does so only when
+the default rules chose review or no stage, and not for a closed pull request
+or a `/fs-retro`, `/fs-triage` or `/fs-prioritize` comment (see
+[Which trigger decides](#which-trigger-decides)), so a broad trigger can start
+reviews the default rules would not. It
+never starts a review from a bot's comment.
+
+The trigger is read from your default branch, so a pull request cannot change
+its own routing. After the change merges, open a pull request: no review
+starts. Comment `/fs-review` on it: one review starts.
+
+### What opts a repository in
+
+Only a `trigger` on the `review` entry in `config.yaml` moves review routing
+to CEL:
+
+| Your configuration | Who decides |
+|---|---|
+| No `review` entry, or one with only `runtime`, `model`, `effort` or `subagents` | The dispatch workflow, as before |
+| `trigger` on the `review` entry | The trigger |
+| A `review` entry with `source:` whose harness sets or inherits `trigger:` | The dispatch workflow, as before |
+
+A harness `trigger:` field never changes when a built-in agent runs, whether
+your own harness writes it or inherits it through `base:`. To route review by
+a trigger you keep in a harness, copy the expression into the `review` entry's
+`trigger` in `config.yaml`. The kill switch and `enabled: false` on the review
+entry keep working as before. The `Route`
+job evaluates the trigger with the fullsend CLI built at the dispatch
+workflow's commit; if your workflow call pins `fullsend_version`, the `Review`
+job runs that version instead.
+
+### Known differences from the default rules
+
+A trigger is checked by the same permission gate as other CEL-dispatched
+agents: the review harness's `role: review` needs at least triage access, so
+triage-role users can start a review as before. Some cases still differ from
+the dispatch workflow's built-in rules:
+
+| Case | Default rules | Trigger |
+|---|---|---|
+| Pull request opened or pushed by a bot without a registered fullsend role | Reviewed | Not reviewed |
+| Pull request pushed by the fix agent | Reviewed | Not reviewed until [#8329](https://github.com/fullsend-ai/fullsend/issues/8329) ships, so the review → fix → re-review loop stops |
+| Who is checked when a pull request is opened, pushed to or marked ready | The pull request author | The user who sent the event |
+| A maintainer's push to an outside contributor's fork pull request | Not reviewed | Reviewed |
+
+> [!WARNING]
+> Opt in only after
+> [#8329](https://github.com/fullsend-ai/fullsend/issues/8329) ships, or
+> accept that pushes from the fix agent no longer start a re-review. Until
+> then the trigger path does not look up a bot's role.
+
+### Checking the decision
+
+When a trigger is set, the `Route` job's "Finalize stage" step logs the
+decision for each pull request and pull request comment. To catch an invalid
+trigger before it merges, see
+[Checking a trigger before you merge](#checking-a-trigger-before-you-merge).
+
+```text
+CEL route (review): bash=review cel=skip reason=trigger did not match harness=agents@3c3081741e3c
+```
+
+The job summary shows `review_route=cel` when the trigger decided, or
+`review_route=bash` when the dispatch workflow did: the kill switch is on or
+the review entry is disabled.
+
+| Log text | Meaning | Action |
+|---|---|---|
+| `cel=skip reason=trigger did not match` | The trigger left this event out | Expected for events your trigger excludes; otherwise fix the trigger |
+| `cel=skip reason=actor not authorized` | The actor failed the dispatch permission check | See [Known differences from the default rules](#known-differences-from-the-default-rules) for bots |
+| `cel=skip reason=harness unavailable; actor below write` | The review harness could not be fetched or loaded, so only write access passes | Check the route step's warning for the harness error |
+| `cel=skip reason=trigger evaluation failed: …` | The trigger compiles but failed on this event, for example it reads a field the event lacks without `has()`; this counts as no match | Guard optional fields with `has()` |
+| `CEL route failed; keeping the bash stage` | A CEL route step failed or the configuration is invalid, so the dispatch workflow decided | Open the failed "… CEL route" step for the error, for example an invalid `trigger` or another invalid `agents:` entry |
+| `invalid agent config: agents[N] (review): invalid trigger` in any agent job | The `trigger` in `config.yaml` does not compile; every agent run validates the whole `agents:` list, so all agents fail, not only review | Fix the expression in `.fullsend/config.yaml`; see [Checking a trigger before you merge](#checking-a-trigger-before-you-merge) |
+
+## Choosing when retro runs
+
+By default, the dispatch workflow starts the retro agent when a pull request
+is closed, merged or not, and on a `/fs-retro` comment on an issue or a pull
+request. To decide it yourself, give the `retro` entry in
+`.fullsend/config.yaml` a `trigger`. The retro still runs in the same `Retro`
+job; the trigger only decides whether that job starts. What opts a repository
+in, and how to check the decision, work as for review: see
+[What opts a repository in](#what-opts-a-repository-in) and
+[Checking the decision](#checking-the-decision), with `retro` in place of
+`review` (`CEL route (retro): ...`, `retro_route=cel`). To check a retro
+trigger before you merge, see
+[Checking a trigger before you merge](#checking-a-trigger-before-you-merge).
+
+### Example: retro only on `/fs-retro`
+
+To stop the retro on every closed pull request but keep `/fs-retro`, add this
+entry to `.fullsend/config.yaml` on your default branch:
+
+```yaml
+agents:
+  - name: retro
+    trigger: >-
+      event.transition.kind == "comment_added"
+      && has(event.transition.comment.command)
+      && event.transition.comment.command == "/fs-retro"
+      && event.actor.kind == "human"
+```
+
+After the change merges, close a pull request: no retro starts. Comment
+`/fs-retro` on it: one retro starts.
+
+The `Route` job asks the trigger only about closed pull requests and
+`/fs-retro` comments; every other event keeps the dispatch workflow's rules,
+and a bot's `/fs-retro` comment never starts a retro.
+
+### Who can start a retro
+
+A trigger decides which events start a retro, not who may start one:
+
+- **Closing a pull request:** anyone who closes or merges it, including its
+  read-only author and bots without a registered fullsend role, as with the
+  dispatch workflow. Only the retro agent gets this exception (the
+  [lifecycle-close exception](../../normative/authorization/v1/README.md#lifecycle-close-pull_request_targetclosed)).
+- **`/fs-retro`:** users with write access or above.
+
+## Choosing when triage and prioritize run
+
+The triage and prioritize agents opt in the same way as review: give the
+`triage` or `prioritize` entry in `.fullsend/config.yaml` a `trigger`, and
+that trigger, not the dispatch workflow's built-in rules, decides whether the
+`Triage` or `Prioritize` job starts. The rules in
+[What opts a repository in](#what-opts-a-repository-in) apply to both, with
+`triage` or `prioritize` in place of `review`. Each agent opts in on its own: a
+`triage` trigger does not change when prioritize runs. To check either trigger
+before you merge, see
+[Checking a trigger before you merge](#checking-a-trigger-before-you-merge).
+
+A trigger only sees the events that reach the `Route` job. The workflow that
+`fullsend` installs in your repository forwards issues opened, edited and
+labeled, and comments that start with `/fs-` from people, not bots. So a
+prioritize trigger only decides `/fs-prioritize`, and on a pull request only
+`/fs-triage` asks the triage trigger.
+
+By default the dispatch workflow starts:
+
+- **Triage** when an issue is opened or edited, when the `ready-for-triage`
+  label is added to an issue, and on a `/fs-triage` comment on an issue or a
+  pull request.
+- **Prioritize** on a `/fs-prioritize` comment on an issue or a pull request.
+  The scheduled scoring run (a scheduler workflow that dispatches
+  `prioritize.yml`) does not go through this routing, so a trigger does not
+  change it.
+
+### Example: triage only on `/fs-triage`
+
+To stop triaging every new or edited issue but keep `/fs-triage`, add this
+entry to `.fullsend/config.yaml` on your default branch:
+
+```yaml
+agents:
+  - name: triage
+    trigger: >-
+      event.entity.kind == "work_item"
+      && event.transition.kind == "comment_added"
+      && has(event.transition.comment.command)
+      && event.transition.comment.command == "/fs-triage"
+      && event.actor.kind == "human"
+```
+
+After the change merges, open an issue: no triage starts. Comment
+`/fs-triage` on it: one triage starts. The `Route` job summary shows
+`triage_route=cel`.
+
+Leave out the `ready-for-triage` label at your own cost: when the triage
+agent splits an issue, it labels each new sub-issue `ready-for-triage` so that
+the sub-issue is triaged. Keep a label arm like this one if you rely on
+splits:
+
+```text
+(event.entity.kind == "work_item"
+  && event.transition.kind == "label_changed"
+  && event.transition.label.name == "ready-for-triage"
+  && event.transition.label.action == "added")
+```
+
+### Which trigger decides
+
+The `Route` job asks one agent's trigger per event:
+
+| Event | Agent asked |
+|---|---|
+| An issue opened, edited or labeled | `triage` |
+| A pull request closed, merged or not | `retro` |
+| A pull request opened, pushed to, marked ready or labeled | `review` |
+| A `/fs-` comment that the built-in rules route to `review`, `retro`, `triage` or `prioritize` | That agent |
+| Any other `/fs-retro`, `/fs-triage` or `/fs-prioritize` comment | `retro`, `triage` or `prioritize` |
+| Any other `/fs-` comment on a pull request | `review` |
+| Any other `/fs-` comment on an issue | `triage` |
+
+An event the built-in rules route to another stage, such as `/fs-code` or the
+`ready-to-code` label, is never handed to a trigger.
+
+### Copying the built-in triage rules into a trigger
+
+To start from the built-in rules and then change them, write them as a
+trigger. Keep the `event.actor.kind == "human"` guard on opened and edited:
+it stops the triage agent's own sub-issues and edits from being triaged
+twice once bots are recognized
+([#8329](https://github.com/fullsend-ai/fullsend/issues/8329)).
+
+```yaml
+agents:
+  - name: triage
+    trigger: >-
+      (event.entity.kind == "work_item"
+        && event.transition.kind in ["opened", "edited"]
+        && event.actor.kind == "human")
+      || (event.entity.kind == "work_item"
+        && event.transition.kind == "label_changed"
+        && event.transition.label.name == "ready-for-triage"
+        && event.transition.label.action == "added")
+      || (event.entity.kind in ["work_item", "change_proposal"]
+        && event.transition.kind == "comment_added"
+        && has(event.transition.comment.command)
+        && event.transition.comment.command == "/fs-triage"
+        && event.actor.kind == "human")
+```
+
+It differs from the built-in rules in one case:
+
+| Case | Built-in rules | This trigger |
+|---|---|---|
+| An issue opened or edited by a bot, for example a sub-issue the triage agent creates | Triaged when the bot holds a collaborator role | Not triaged; the sub-issue is triaged through its `ready-for-triage` label |
+
+### Checking a trigger before you merge
+
+A `trigger` on the `review`, `retro`, `triage` or `prioritize` entry that does
+not compile, or does not return a boolean, still merges. After the merge,
+every agent run in the repository fails with `invalid agent config:
+agents[N] (<name>): invalid trigger`. To catch this before you merge, run
+[`fullsend lint`](../../cli/lint.md) from the repository root:
+
+```bash
+fullsend lint
+```
+
+If the configuration directory is not `.fullsend` in the current directory,
+pass its path:
+
+```bash
+fullsend lint --fullsend-dir <path>
+```
+
+`fullsend lint` loads `.fullsend/config.yaml`, layered over
+`.fullsend/config.base.yaml` if you have one, with the same validation agent
+runs use. It exits 1 when it finds an error.
+
+`fullsend lint` caches the agents it fetches in `.fullsend/.fullsend-cache/`.
+Add `.fullsend/.fullsend-cache/` to your `.gitignore`, or delete the directory
+before you commit.
+
+#### A valid trigger
+
+This `.fullsend/config.yaml` holds only the `review` entry from
+[Example: review only on `/fs-review`](#example-review-only-on-fs-review):
+
+```yaml
+version: "1"
+agents:
+  - name: review
+    trigger: >-
+      event.transition.kind == "comment_added"
+      && has(event.entity.linked_change_proposal)
+      && has(event.transition.comment.command)
+      && event.transition.comment.command == "/fs-review"
+      && event.actor.kind == "human"
+```
+
+```text
+$ fullsend lint
+  • Fetching agent review from fullsend-ai/agents@5144c1d561a0
+  ✓ agent review resolved from fullsend-ai/agents@main
+  ! review: warning: env.sandbox: env.sandbox coexists with host_files entry /home/user/repo/.fullsend/.fullsend-cache/resources/sha256/e2874d7d47a7a710f89ea6dcb99ae3b8c720ac06fccb7499dfddbe14f12b5ecb/content.env (dest: /sandbox/workspace/.env.d/gcp-vertex.env); env.sandbox values take precedence on key collision
+  ! review: warning: forge: forge is deprecated; use overlays with CEL when expressions instead (see ADR 0088)
+$ echo $?
+0
+```
+
+There is no `error:` line, so the trigger is valid. The entry has no `source:`,
+so `fullsend lint` fetches the `review` agent from the agents repository and
+lints it too. The two `warning:` lines come from that agent, not from your
+`config.yaml` (see [Reading the output](#reading-the-output)).
+
+#### A syntax error
+
+This `review` trigger ends with a stray `&&`:
+
+```yaml
+version: "1"
+agents:
+  - name: review
+    trigger: >-
+      event.transition.kind == "comment_added"
+      && has(event.entity.linked_change_proposal)
+      && has(event.transition.comment.command)
+      && event.transition.comment.command == "/fs-review"
+      && event.actor.kind == "human" &&
+```
+
+```text
+$ fullsend lint
+  ✗ config: error: config.yaml: agents[0] (review): invalid trigger: ERROR: <input>:1:212: Syntax error: mismatched input '<EOF>' expecting {'[', '{', '(', '.', '-', '!', 'true', 'false', 'null', NUM_FLOAT, NUM_INT, NUM_UINT, STRING, BYTES, IDENTIFIER}
+ | event.transition.kind == "comment_added" && has(event.entity.linked_change_proposal) && has(event.transition.comment.command) && event.transition.comment.command == "/fs-review" && event.actor.kind == "human" &&
+ | ...................................................................................................................................................................................................................^
+Error: lint found 1 error-level diagnostic(s)
+$ echo $?
+1
+```
+
+`agents[0] (review)` names the entry. `<input>:1:212` is line 1, column 212
+of the trigger as YAML reads it: the `>-` block joins the trigger into one
+line. The caret marks where parsing failed, here the end of the expression.
+
+#### A trigger that does not return a boolean
+
+This `review` trigger is a string, not a condition:
+
+```yaml
+version: "1"
+agents:
+  - name: review
+    trigger: '"opened"'
+```
+
+```text
+$ fullsend lint
+  ✗ config: error: config.yaml: agents[0] (review): invalid trigger: trigger expression must evaluate to bool, got string
+Error: lint found 1 error-level diagnostic(s)
+$ echo $?
+1
+```
+
+#### Reading the output
+
+| Output | Meaning | Action |
+|---|---|---|
+| `invalid trigger: ERROR: <input>:L:N: Syntax error: …` | The trigger does not compile; the caret marks line `L`, column `N` of the trigger as YAML reads it | Fix the expression at the caret in `.fullsend/config.yaml` |
+| `invalid trigger: trigger expression must evaluate to bool, got string` | The trigger compiles but returns a string, not `true` or `false` | Write a condition, for example `event.transition.kind == "opened"` |
+| `! Git token not available; private repo fetches may fail` | No `GH_TOKEN`, `GITHUB_TOKEN` or `gh` login was found | Nothing to fix for the public agents repository; set `GH_TOKEN` to remove the line |
+| A `warning:` line prefixed with an agent name, for example `review: warning: forge: forge is deprecated` | The warning comes from the upstream harness that an entry without `source:` resolves from the agents repository | Nothing to fix in this repository; warnings do not fail the run unless you pass `--strict` |
+
+`fullsend lint` does not evaluate triggers against events. A trigger that
+compiles but reads a field the event lacks without `has()` evaluates to an
+error at run time, which counts as no match (`cel=skip`); see the
+`Guard optional fields with has()` row in
+[Checking the decision](#checking-the-decision).
+
+#### Running the check in CI
+
+This GitHub Actions workflow runs `fullsend lint` on every pull request that
+changes `.fullsend/config.yaml` or `.fullsend/config.base.yaml`. It installs
+the CLI with the same action and `agent: __install_only__` input as
+[Building custom agents](building-custom-agents.md):
+
+```yaml
+name: Lint fullsend config
+
+on:
+  pull_request:
+    paths: ['.fullsend/config.yaml', '.fullsend/config.base.yaml']
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install fullsend CLI
+        uses: fullsend-ai/fullsend@vX.Y.Z
+        with:
+          agent: __install_only__
+          version: vX.Y.Z
+
+      - name: Lint fullsend config
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: fullsend lint --fullsend-dir .fullsend
+```
+
+`fullsend lint` first ships in the release after v0.50.0. Replace both
+`vX.Y.Z` values with that release or a later one. The `version` input picks the CLI release
+the step installs, and it defaults to `latest`. If the repository vendors the
+CLI at `.fullsend/bin/fullsend`, the step uses that binary instead, so it
+must also be that release or later.
+
+An entry without `source:` makes `fullsend lint` fetch the agent from the
+agents repository, so the job needs network access; `GH_TOKEN` authenticates
+that request, and `--offline` cannot
+resolve that entry
+([#8743](https://github.com/fullsend-ai/fullsend/issues/8743)).
+
 ## Agent dispatch authorization
 
 By default, fullsend checks the forge's permission API to decide who can
 trigger agents. Users with `write` or above can trigger all agents; users
-with `triage` can trigger observation agents (`/fs-triage`, `/fs-review`)
-only. This triage-level access applies to **GitHub webhook dispatch** (slash
-commands, label-triggered dispatch, and event-triggered dispatch). The Go
-poll path used for GitLab and Jira currently requires `write` for all
-non-exception transitions — it does not yet distinguish observation from
-mutation thresholds. On GitLab, the agent job also requires the event actor
+with `triage` can trigger the built-in observation agents (`/fs-triage`,
+`/fs-review`). This applies to **GitHub webhook dispatch** (slash commands,
+label-triggered dispatch, and event-triggered dispatch).
+
+On the CEL dispatch path (GitHub `fullsend dispatch` and the Jira poll), the
+threshold follows the harness `role:`:
+
+- `role: triage` or `role: review` — triage-level actors can trigger it,
+  including OWNERS reviewers on GitHub when
+  [OWNERS authorization](owners-file-authorization.md) is enabled.
+- Any other `role:` — the actor needs `write`.
+
+GitLab uses its own stage router, which applies the same triage and write
+split to slash commands. The GitLab agent job also requires the event actor
 to hold Developer access or higher for every stage except retro and
 prioritize, so automatic triage of a newly opened issue runs only when its
 author is a Developer, Maintainer, or Owner.

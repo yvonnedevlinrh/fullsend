@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/fullsend-ai/fullsend/internal/celtrigger"
 	"github.com/fullsend-ai/fullsend/internal/urlutil"
 	"gopkg.in/yaml.v3"
 )
@@ -41,6 +42,12 @@ var validConfigAgentName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
 // (ValidAgentNames) or matches a sourced entry in a parent layer; the
 // built-in keeps resolving through the agents-repo fallback.
 //
+// Trigger is a CEL boolean over the normalized event (ADR 0061). It decides
+// routing for the built-in review, retro, triage and prioritize agents only
+// (fullsend dispatch --route <agent>); CEL dispatch and the Jira poller keep
+// using the harness trigger:. An omitted or empty value inherits the parent
+// layer's.
+//
 // Subagents maps persona names to model references, controlling which
 // model each sub-agent persona runs on. The "default" key sets the
 // fallback for personas without an explicit entry. A nil *string value
@@ -56,12 +63,13 @@ type AgentEntry struct {
 	Model     string             `yaml:"model,omitempty"`
 	Effort    string             `yaml:"effort,omitempty"`
 	Subagents map[string]*string `yaml:"subagents,omitempty"`
+	Trigger   string             `yaml:"trigger,omitempty"`
 }
 
-// HasSettings reports whether the entry tunes runtime, model, effort
-// or subagents.
+// HasSettings reports whether the entry tunes runtime, model, effort,
+// subagents or trigger.
 func (a AgentEntry) HasSettings() bool {
-	return a.Runtime != "" || a.Model != "" || a.Effort != "" || len(a.Subagents) > 0
+	return a.Runtime != "" || a.Model != "" || a.Effort != "" || len(a.Subagents) > 0 || strings.TrimSpace(a.Trigger) != ""
 }
 
 // IsOverrideOnly reports whether the entry only tunes an agent defined
@@ -154,6 +162,8 @@ func (a AgentEntry) DerivedName() string {
 const (
 	// DefaultUpstreamRepo is the canonical fullsend repository for layered workflow calls.
 	DefaultUpstreamRepo = "fullsend-ai/fullsend"
+	// DefaultAgentsRepo is the canonical repository for upstream agent resources.
+	DefaultAgentsRepo = "fullsend-ai/agents"
 	// DefaultUpstreamRef is the default ref for layered upstream workflow calls.
 	DefaultUpstreamRef = "main"
 	// DefaultGHRunner is the default GitHub Actions runner image for scaffold workflows.
@@ -177,6 +187,15 @@ type PerRepoInferenceConfig struct {
 	Project     string `yaml:"project,omitempty"`
 	Region      string `yaml:"region,omitempty"`
 	WIFProvider string `yaml:"wif_provider,omitempty"`
+	// WIFAudience is the audience GitLab puts in the agent job's ID token
+	// when the WIF provider is an existing one that accepts a different
+	// audience than "fullsend". GitLab vertex-wif only; install time only.
+	WIFAudience string `yaml:"wif_audience,omitempty"`
+	// ServiceAccount is the email of a Google service account the GitLab
+	// agent job impersonates after the federated token exchange, for
+	// installs that cannot grant the federated principal project IAM roles.
+	// GitLab vertex-wif only; install time only.
+	ServiceAccount string `yaml:"service_account,omitempty"`
 	// OpenAI holds the OpenAI Workload Identity Federation identifiers
 	// (ADR 0092). They are not secrets: the mapping they name only
 	// trusts a GitHub OIDC token whose claims match, and the run prints
@@ -464,6 +483,9 @@ func validateAgentSettings(i int, entry AgentEntry) error {
 	if entry.Effort != "" && !ValidEffort(entry.Effort) {
 		return fmt.Errorf("agents[%d] (%s): invalid effort %q: must be one of %s", i, label, entry.Effort, strings.Join(ValidEffortLevels(), ", "))
 	}
+	if err := celtrigger.Validate(entry.Trigger); err != nil {
+		return fmt.Errorf("agents[%d] (%s): invalid trigger: %w", i, label, err)
+	}
 	for key, val := range entry.Subagents {
 		if !ValidSubagentKey(key) {
 			return fmt.Errorf("agents[%d] (%s): invalid subagent key %q: must be lowercase alphanumeric segments joined by hyphens (max 64 chars), or \"default\"", i, label, key)
@@ -546,7 +568,7 @@ func validateAgentEntries(agents []AgentEntry, allowlist []string, enforceAllowl
 			// merge (the merged entry carries the parent's source), so by the
 			// time an entry reaches validation without one it must be built in.
 			if !entry.HasSettings() {
-				return fmt.Errorf("agents[%d]: enabled agent entry must have a source (or, to tune a built-in agent, a name plus runtime, model, effort or subagents)", i)
+				return fmt.Errorf("agents[%d]: enabled agent entry must have a source (or, to tune a built-in agent, a name plus runtime, model, effort, subagents or trigger)", i)
 			}
 			if entry.Name == "" {
 				return fmt.Errorf("agents[%d]: agent entry without a source must name the agent it tunes", i)
@@ -741,11 +763,11 @@ func NewPerRepoConfig(roles []string, targetRepo string) PerRepoConfigWriter {
 	if targetRepo != "" {
 		// The target repository itself is implicitly allowed by the
 		// triage and retro post-scripts, so only the upstream
-		// cross-repo permission (retro proposals, triage prerequisites)
-		// needs an explicit entry (#8218).
+		// cross-repo permissions (retro proposals, triage prerequisites)
+		// need explicit entries (#8218, #8504).
 		cfg.CreateIssues = &CreateIssuesConfig{
 			AllowTargets: AllowTargets{
-				Repos: []string{DefaultUpstreamRepo},
+				Repos: DefaultIssueCreationRepos(),
 			},
 		}
 	}

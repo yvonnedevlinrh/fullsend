@@ -45,6 +45,49 @@ When a CLI change makes an ADR's decision obsolete, write a **new ADR** that sup
 
 Heading anchors on the docs site follow GitHub's slug rules (for example `## 4. Next step` is `#4-next-step`), so a link that lychee (`make lint-md-links`) accepts also works on the site.
 
+## Line wrapping
+
+Wrap prose in Markdown files at about 80 columns. Git and GitHub compare
+Markdown line by line. When a paragraph sits on one long line, editing a single
+word marks the whole paragraph as changed, and reviewers have to hunt for the
+real edit. When lines are wrapped, a small wording fix changes only the lines
+it touches.
+
+- Break lines at word boundaries, close to 80 columns. The limit is a guide,
+  not an exact count, and no linter enforces it, so reviewers check it.
+- Indent the continuation lines of a list item to line up with the item's
+  text, so they stay part of the item.
+- Wrapping does not change the rendered page. Markdown joins consecutive lines
+  of a paragraph into one.
+
+Leave these as they are, because wrapping them breaks rendering or meaning:
+
+- Table rows. Each row must stay on one line.
+- Fenced code blocks. Keep their content exactly as it should be copied or
+  run.
+- Headings.
+- Long URLs and link targets that do not fit within the limit by themselves.
+
+Do not rewrap existing documents wholesale. That produces the same large diffs
+this rule is meant to prevent. Write new content wrapped, and rewrap an
+existing paragraph only when you are already editing it.
+
+## CLI reference pages are manually maintained
+
+CLI reference pages under `docs/cli/` are manually maintained and will not
+auto-update. When modifying CLI commands, flag help text, defaults, or behavior
+in `internal/cli/`, update the corresponding reference page in `docs/cli/` as
+well as relevant tables and descriptions in `docs/guides/`.
+
+## Adding new documentation pages
+
+When adding a new doc under `docs/`, check `docs/.vitepress/config.ts` sidebar
+configuration. Sections using `getMarkdownFiles()` are auto-discovered,
+including nested directories (which become nested sidebar groups). All other
+sections require a manual `{ text, link }` entry. Also add the new folder's
+prefix to `search.options.scopes` in the same file so the folder's pages are
+reachable when search scope pills are active.
+
 ## Cross-reference by command group
 
 Each row lists the documentation touchpoints for a major CLI command group. The **Go source** column is where inline `Short`/`Long` help text lives.
@@ -60,7 +103,7 @@ Each row lists the documentation touchpoints for a major CLI command group. The 
 
 ### `admin foreign`
 
-The `admin` command group's `uninstall`/`analyze`/`enable`/`disable` subcommands were removed with per-org installation ([ADR-0044](../ADRs/0044-deprecate-per-org-installation-mode.md)); `admin install` remains as repository-only (`<owner/repo>`) installation. The other actively supported subcommand is `admin foreign` (cross-org mint-authorization allow-list).
+The `admin` command group's `uninstall`/`analyze`/`enable`/`disable` subcommands were removed with per-org installation ([ADR-0044](../ADRs/0044-deprecate-per-org-installation-mode.md)); `admin install` is deprecated but still works as repository-only (`<owner/repo>`) installation (it still creates every role's GitHub App in one run). The other actively supported subcommand is `admin foreign` (cross-org mint-authorization allow-list).
 
 | Category | Files |
 |----------|-------|
@@ -124,8 +167,8 @@ The `admin` command group's `uninstall`/`analyze`/`enable`/`disable` subcommands
 
 ## Minor commands
 
-The commands below have lighter documentation footprints. Apply the general `grep` rule when changing them:
-
-`dispatch`, `scan`, `lock`, `poll`, `fetch-skill`, `fetch-review-threads`, `post-review`, `post-comment`, `reconcile-status`, `resolve-mr-source`, `check-protected-branch`
-
-The most comprehensive single reference for all commands (including minor ones) is `docs/guides/dev/cli-internals.md`, which documents the full command tree with flags.
+Commands without a subsection above have lighter documentation footprints.
+Apply the general `grep` rule when changing them. The comprehensive single
+reference for all commands (including minor ones) is
+`docs/guides/dev/cli-internals.md`, which documents the full command tree
+with flags.

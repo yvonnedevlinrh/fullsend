@@ -5,6 +5,8 @@ package forge
 
 import (
 	"context"
+	"crypto/sha1" //nolint:gosec // Git's blob hash algorithm, not used for security
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +47,12 @@ const (
 	VarReviewClientID = "FULLSEND_REVIEW_CLIENT_ID"
 	VarAppSet         = "FULLSEND_APP_SET"
 
+	// VarGCPServiceAccount is the GitLab CI/CD variable naming the
+	// service account the agent job impersonates for Vertex inference
+	// (config.inference.service_account). Written only when configured;
+	// unset keeps direct federated identity.
+	VarGCPServiceAccount = "FULLSEND_GCP_SERVICE_ACCOUNT"
+
 	// User-managed OpenAI Workload Identity identifier variables.
 	VarOpenAIAudience           = "FULLSEND_OPENAI_AUDIENCE"
 	VarOpenAIIdentityProviderID = "FULLSEND_OPENAI_IDENTITY_PROVIDER_ID"
@@ -52,7 +60,8 @@ const (
 
 	// Retired GitLab poller state variables. Superseded by HMAC-signed
 	// state.json on fullsend-poll-state-slash / fullsend-poll-state-events.
-	// Install no longer seeds them; converge migrate-then-deletes them.
+	// Install and converge neither seed nor migrate them; uninstall
+	// deletes any leftovers.
 	VarLastPollAtFast     = "FULLSEND_LAST_POLL_AT_FAST"
 	VarLastPollAtFull     = "FULLSEND_LAST_POLL_AT_FULL"
 	VarLabelState         = "FULLSEND_LABEL_STATE"
@@ -145,6 +154,13 @@ const (
 	// GitLabDispatchRouteAPI is the VarGitLabDispatchRoute value that keeps
 	// the Poller-credential pipelines API dispatch route.
 	GitLabDispatchRouteAPI = "api"
+	// VarGitLabAnalystUserID is the job-local numeric GitLab user ID of the
+	// registered Analyst identity, which the GitLab poll and dispatcher job
+	// scripts resolve with the Analyst credential before blanking it and
+	// export for `fullsend poll` (#8807). It is never a CI/CD variable.
+	// Unset means unknown: no changes-requested marker reaches the fix
+	// stage.
+	VarGitLabAnalystUserID = "FULLSEND_GITLAB_ANALYST_USER_ID"
 
 	// VarGitLabRoleRegistry is the administrator-controlled GitLab role
 	// registry (JSON policy and credential *references*, never raw
@@ -244,6 +260,24 @@ var ErrAlreadyExists = errors.New("already exists")
 // IsAlreadyExists reports whether err indicates a duplicate resource.
 func IsAlreadyExists(err error) bool {
 	return errors.Is(err, ErrAlreadyExists)
+}
+
+// ErrConflict indicates that a conditional write was rejected because
+// the target changed since the caller read it (see UpdateFileIfMatch).
+var ErrConflict = errors.New("conflict")
+
+// IsConflict reports whether err indicates a rejected conditional write.
+func IsConflict(err error) bool {
+	return errors.Is(err, ErrConflict)
+}
+
+// GitBlobSHA returns the Git blob object ID (SHA-1) of content: the
+// expectedSHA UpdateFileIfMatch compares against the stored file.
+func GitBlobSHA(content []byte) string {
+	h := sha1.New() //nolint:gosec // Git's blob hash algorithm, not used for security
+	fmt.Fprintf(h, "blob %d\x00", len(content))
+	h.Write(content)
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // ErrBranchProtected indicates that a ref update failed because the
@@ -447,10 +481,16 @@ type Repository struct {
 	Private       bool
 	Archived      bool
 	Fork          bool
+	// Description is the repository description. Populated by CreateRepo
+	// and GetRepo; list operations may leave it empty.
+	Description string
 	// CIConfigPath is the project's configured CI configuration path, as
 	// reported by GitLab (ci_config_path). Empty means the default
 	// .gitlab-ci.yml at the repository root. Other forges leave it empty.
 	CIConfigPath string
+	// CreatedAt is when the repository was created. Populated by the
+	// GitHub CreateRepo and GetRepo; zero when the forge did not report it.
+	CreatedAt time.Time
 }
 
 // ChangeProposal represents a pull request or merge request.
@@ -538,6 +578,13 @@ type Issue struct {
 	Body   string
 	URL    string
 	Labels []string
+	// State is "open" or "closed". It is only populated by GetIssue;
+	// other issue reads leave it empty.
+	State string
+	// StateReason is GitHub's state_reason: "completed", "not_planned"
+	// or "duplicate" for a closed issue, "reopened" or empty otherwise.
+	// GitLab does not report one. Only populated by GetIssue.
+	StateReason string
 }
 
 // IssueComment represents a comment on an issue.
@@ -854,6 +901,18 @@ type Client interface {
 	CreateOrUpdateFile(ctx context.Context, owner, repo, path, message string, content []byte) error
 
 	GetFileContent(ctx context.Context, owner, repo, path string) ([]byte, error)
+
+	// UpdateFileIfMatch writes content to path on the default branch only
+	// if the file's current Git blob SHA equals expectedSHA (GitBlobSHA of
+	// the content the caller read). An empty expectedSHA creates the file
+	// only if it does not exist yet. When the file changed, was deleted,
+	// or (for an empty expectedSHA) already exists, it returns an error
+	// wrapping ErrConflict. The write is attempted once: implementations
+	// must not retry it after a conflict or an ambiguous failure. The
+	// caller decides whether to reread and try again. GitLab returns
+	// ErrNotSupported.
+	UpdateFileIfMatch(ctx context.Context, owner, repo, path, message string, content []byte, expectedSHA string) error
+
 	DeleteFile(ctx context.Context, owner, repo, path, message string) error
 
 	// DeleteFiles atomically removes multiple paths in a single commit.
@@ -1268,9 +1327,6 @@ type Client interface {
 	DeletePipelineSchedule(ctx context.Context, owner, repo string, scheduleID int64) error
 	// GetPipelineSchedule includes variables omitted by GitLab's list endpoint.
 	GetPipelineSchedule(ctx context.Context, owner, repo string, scheduleID int64) (*PipelineSchedule, error)
-	// DeletePipelineScheduleVariable deletes one schedule-level variable from
-	// an existing pipeline schedule. GitHub returns ErrNotSupported.
-	DeletePipelineScheduleVariable(ctx context.Context, owner, repo string, scheduleID int64, key string) error
 	ListPipelineSchedules(ctx context.Context, owner, repo string) ([]PipelineSchedule, error)
 	// UpdatePipelineSchedule sets whether an existing pipeline schedule is
 	// active. Used to reactivate required GitLab schedules that exist but
@@ -1345,6 +1401,15 @@ type Client interface {
 	// than treat an unreported setting as disabled. Returns ErrNotFound if
 	// the project does not exist. GitHub returns ErrNotSupported.
 	GetJobTokenRepositoryPushAllowed(ctx context.Context, owner, repo string) (bool, error)
+	// GetPushRuleBranchNameRegex returns the branch_name_regex of the
+	// GitLab project's push rule (GET /projects/:id/push_rule), which
+	// every pushed or API-created branch name must match. Returns
+	// ("", nil) when the project has no push rule or the rule sets no
+	// branch name regex. Returns ErrNotFound when the endpoint or project
+	// is unavailable (push rules are not offered on every GitLab edition)
+	// and ErrForbidden when the caller may not read push rules. GitHub
+	// returns ErrNotSupported.
+	GetPushRuleBranchNameRegex(ctx context.Context, owner, repo string) (string, error)
 
 	// Commit comparison
 	// CompareCommits compares two commits and returns their relationship

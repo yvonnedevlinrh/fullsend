@@ -219,6 +219,13 @@ trigger-token threat model for the new inbound-surface controls.
 > dropped the leftover empty `dispatch` stage from the required stage
 > list and strips it from already-enrolled root files on converge
 > (`StripObsoleteGitLabStages`).
+>
+> **Update (2026-10, #8031):** After the webhook-dispatch rollout, these
+> converge-time migrations were removed, as were the converge deletion
+> of a leftover `fullsend-dispatch.yml` and the status/upgrade read of
+> its version marker. Converge now reports a leftover stub as an orphan.
+> Uninstall still deletes it, and still removes the obsolete
+> `merge_request_event` rule from a fullsend-owned `workflow:` block.
 
 ## Context
 
@@ -436,6 +443,12 @@ protected, masked CI/CD variable (`FULLSEND_FORGE_TOKEN`).
 > CI/CD-variable state when present). The poller self-heals a deleted
 > branch within one cycle. `repos uninstall` deletes both branches.
 >
+> **Update (2026-10, #8032):** The legacy CI/CD-variable migration was
+> removed. Install and converge seed missing branches with an empty
+> signed baseline and neither read nor delete the retired variables.
+> The orphan detector still ignores them, and uninstall still deletes
+> them.
+>
 > Phase 3c (#7381) dropped the created bot PAT from Maintainer (40)
 > to Developer (30); Developer can force-write and delete an
 > unprotected branch. The historical Maintainer-role description
@@ -609,6 +622,13 @@ configuration.
 | MR merged | Cron poll (MR `merged_at` > watermark) | retro |
 | MR closed (unmerged) | Cron poll (MR `closed_at` > watermark, `merged_at` empty) | retro |
 | MR note with `<!-- fullsend:changes-requested -->` | Cron poll (note body marker) | fix (same-project MRs only) |
+
+> **Update (2026-10, [#8553](https://github.com/fullsend-ai/fullsend/issues/8553) / [ADR 0125](0125-gitlab-hybrid-webhook-poller-dispatch.md)):**
+> The events poll also acts as a backstop for a missed webhook issue-open
+> delivery: an issue opened after both the discovery watermark and a persisted
+> installation cutoff is dispatched as an issue-opened event. See the
+> [normalized event README](../normative/normalized-event/v1/README.md) for
+> details.
 
 Bot-authored comments are skipped to prevent re-triggering loops (exception:
 the `changes-requested` marker from the review agent).

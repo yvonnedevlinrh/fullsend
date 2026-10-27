@@ -83,6 +83,39 @@ func (p *Poller) discoverAllEvents(ctx context.Context, owner, repo string, sinc
 
 	var minSkippedAt time.Time
 	for _, issue := range issues {
+		// Issue opens normally dispatch from the webhook fast-path; the
+		// poller recovers one whose delivery was missed (ADR 0125). The
+		// event matches webhookIssueEvents' (created_at time, author
+		// actor), so both share one Key() and a delivered webhook
+		// suppresses this dispatch. Bounding on created_at rather than
+		// updated_at keeps an unrelated edit of an older issue from
+		// re-emitting its open. Emitted before the notes fetch: a notes
+		// failure holds the watermark only to updated_at, which can pass
+		// created_at, so a later cycle would not rediscover the open.
+		// created_at must also follow the persisted installation cutoff, so
+		// an issue that predates installation is never triaged.
+		// A failed dispatch of a recovered open is retried through the
+		// watermark holdback and the failed-key retry count, not a durable
+		// pending handoff (only issue_label failures get one). That relies
+		// on events polls being serialized by the pipeline resource group,
+		// so no other writer persists a later watermark that would drop
+		// created_at out of the next cycle's window; MR events share the
+		// same assumption.
+		if !p.issueOpenCutoff.IsZero() && issue.State == "opened" &&
+			!issue.CreatedAt.IsZero() && issue.CreatedAt.After(since) &&
+			issue.CreatedAt.After(p.issueOpenCutoff) {
+			events = append(events, RoutableEvent{
+				Type:            "issue_event",
+				Action:          "opened",
+				IID:             issue.IID,
+				UpdatedAt:       issue.CreatedAt,
+				NoteAuthorID:    issue.Author.ID,
+				NoteAuthorLogin: issue.Author.Username,
+				IsBot:           issue.Author.Bot,
+				Labels:          issue.Labels,
+			})
+		}
+
 		notes, err := p.client.ListIssueNotes(ctx, owner, repo, issue.IID)
 		if err != nil {
 			log.Printf("list notes for issue %d: %v (skipping issue entirely)", issue.IID, err)
@@ -444,9 +477,47 @@ func isProjectAccessTokenBot(username string) bool {
 	return strings.HasPrefix(username, "project_") && strings.Contains(username, "_bot_")
 }
 
+// needsIssueOpenBotLookup reports whether event is an issue open whose
+// author's bot status must still be read from the authoritative user record.
+func (p *Poller) needsIssueOpenBotLookup(event RoutableEvent) bool {
+	return event.Type == "issue_event" && event.Action == "opened" && !p.isBotEvent(event)
+}
+
+// enrichIssueOpenBot checks the authoritative user record for one issue open.
+// GitLab's nested issue author omits the bot flag on some instances, and
+// service accounts can have custom usernames that defeat name heuristics.
+// An unavailable or incomplete lookup fails closed so the caller can retry.
+func (p *Poller) enrichIssueOpenBot(ctx context.Context, event *RoutableEvent) error {
+	if !p.needsIssueOpenBotLookup(*event) {
+		return nil
+	}
+	if event.NoteAuthorID == 0 {
+		return fmt.Errorf("issue #%d has no author ID", event.IID)
+	}
+	bot, err := p.client.GetUserBot(ctx, event.NoteAuthorID)
+	if err != nil {
+		return fmt.Errorf("look up issue #%d author %d: %w", event.IID, event.NoteAuthorID, err)
+	}
+	event.IsBot = bot
+	return nil
+}
+
+// enrichIssueOpenBots enriches every issue open in events, failing on the
+// first lookup error. The webhook builder uses it because it fails the whole
+// payload closed; the poller enriches per event inside Run instead, so one
+// failing lookup cannot stop unrelated events.
+func (p *Poller) enrichIssueOpenBots(ctx context.Context, events []RoutableEvent) error {
+	for i := range events {
+		if err := p.enrichIssueOpenBot(ctx, &events[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // isBotEvent uses multiple signals for reliable bot detection: the API
-// Bot field (when available), the configured botUserID, and the
-// project access token username pattern.
+// Bot field (when available), the configured botUserID and
+// analystUserID, and the project access token username pattern.
 func (p *Poller) isBotEvent(event RoutableEvent) bool {
 	if event.IsBot {
 		return true
@@ -454,11 +525,20 @@ func (p *Poller) isBotEvent(event RoutableEvent) bool {
 	if p.botUserID != 0 && event.NoteAuthorID == p.botUserID {
 		return true
 	}
+	if p.isAnalystAuthor(event.NoteAuthorID) {
+		return true
+	}
 	return isProjectAccessTokenBot(event.NoteAuthorLogin)
 }
 
-// filterBotEvents removes bot-authored events, except for the enrolled
-// bot's changes-requested markers which trigger the fix stage.
+// isAnalystAuthor reports whether authorID is the registered Analyst
+// identity. An unknown Analyst ID (0) matches no author.
+func (p *Poller) isAnalystAuthor(authorID int) bool {
+	return p.analystUserID != 0 && authorID == p.analystUserID
+}
+
+// filterBotEvents removes bot-authored events, except for the registered
+// Analyst's changes-requested markers which trigger the fix stage.
 func (p *Poller) filterBotEvents(events []RoutableEvent) []RoutableEvent {
 	var filtered []RoutableEvent
 	for _, event := range events {
@@ -466,9 +546,13 @@ func (p *Poller) filterBotEvents(events []RoutableEvent) []RoutableEvent {
 			filtered = append(filtered, event)
 			continue
 		}
+		// The review stage posts the marker as the Analyst, which is a
+		// different identity from the Poller in distinct-role
+		// installations. Markers from the Poller itself or any other bot
+		// stay filtered.
 		if event.Type == "mr_note" &&
 			strings.Contains(event.NoteBody, forge.ChangesRequestedMarker) &&
-			event.NoteAuthorID == p.botUserID {
+			p.isAnalystAuthor(event.NoteAuthorID) {
 			filtered = append(filtered, event)
 			continue
 		}

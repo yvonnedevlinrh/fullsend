@@ -56,7 +56,7 @@ privilege_levels:
 # ── Validation ────────────────────────────────────────────────
 validation_loop:
   script: scripts/validate-output-schema.sh
-  preflight_check: 'python3 -c "import jsonschema"'  # Literal sh -c command (NOT a script path); runs before sandbox creation
+  preflight_check: 'python3 -c "import jsonschema"'  # Literal sh -c command (NOT a script path); runs before sandbox creation in the allowlisted preflight environment
   max_iterations: 2
   feedback_mode: append              # "none" (default) or "append" — append the
                                      # previous iteration's validation failure to
@@ -75,7 +75,7 @@ host_files:
 env:
   runner:                            # Available to pre/post scripts
     MY_VAR: "${MY_VAR}"
-  sandbox:                           # Available inside sandbox
+  sandbox:                           # Available inside sandbox; reserved names are dropped
     MY_SETTING: "value"
 runner_env:                          # ⚠ Deprecated: use env.runner instead
   MY_VAR: "${MY_VAR}"
@@ -154,11 +154,13 @@ Most fields are self-explanatory from the inline comments above. This section ex
 
 **`validation_loop.max_iterations`** — The maximum number of agent runs in one invocation (default 1). A second run happens only when the agent finished and its output failed validation; an iteration the runner killed at `timeout_minutes` is not retried. See [`fullsend run` § Budget and deadline](../cli/run.md#budget-and-deadline) and [ADR 0105](../ADRs/0105-timed-out-iteration-ends-the-run.md).
 
-**`validation_loop.preflight_check`** — A host-dependency probe run before sandbox creation as a literal `sh -c` command ([ADR 0128](../ADRs/0128-preflight-check-literal-command.md)). It uses the host process's working directory and is not resolved through the resource-fetch pipeline. Prefer a self-contained probe such as `python3 -c "import jsonschema"`; a relative script command works only if its file is present in that host working directory.
+**`validation_loop.preflight_check`** — A host-dependency probe run before sandbox creation as a literal `sh -c` command ([ADR 0128](../ADRs/0128-preflight-check-literal-command.md)). It uses the host process's working directory and is not resolved through the resource-fetch pipeline. Prefer a self-contained probe such as `python3 -c "import jsonschema"`; a relative script command works only if its file is present in that host working directory. The probe runs in a minimal allowlisted environment: the host `PATH`, `HOME`, and `TMPDIR` (when set), the runner-forced `FULLSEND_DIR` and `PYTHONDONTWRITEBYTECODE`, and non-credential variables declared under `env.runner`/`runner_env` — nothing else is inherited from the process environment. Credential names (`GH_TOKEN`, `GITHUB_TOKEN`, `GITLAB_TOKEN`, the minted role tokens `PUSH_TOKEN` and `REVIEW_TOKEN`, `FULLSEND_FORGE_TOKEN`, `FULLSEND_FETCH_TOKEN`, `FULLSEND_GITLAB_*` role tokens, `OPENAI_API_KEY`, `GH_WORKFLOW_TOKEN`, and the OIDC/trigger/runner-secret names) are excluded even when declared under `env.runner`. Plain `${VAR}` references are validated and expanded before the command runs: a plain reference to a name outside the allowlisted environment fails the run before any shell executes, naming the variable (never its value) and pointing to the allowlist and the `env.runner` declaration channel. Non-plain brace forms such as `${VAR:-default}` are not validated and silently expand to empty rather than failing the run. On failure or timeout, diagnostics carry only redacted command text and output. When the command contains no `${...}` reference, bare `$VAR` references are left to the shell, where every non-allowlisted name is unset; once a brace reference is present, bare references are also resolved against the preflight environment before the shell runs, and a bare reference to a name outside it expands to empty, matching the shell's unset semantics.
 
 **`env.runner`** — Variables passed to host-side scripts (`pre_script`, `post_script`,
-`validation_loop.script` and `validation_loop.preflight_check`), layered over the `fullsend run`
-process environment. A few named workflow secrets are **not** inherited from that environment:
+and `validation_loop.script`), layered over the `fullsend run`
+process environment. (`validation_loop.preflight_check` also reads `env.runner`
+declarations, but atop its own allowlisted environment — see above, not the
+process environment.) A few named workflow secrets are **not** inherited from that environment:
 `JIRA_TOKEN`, `JIRA_USER_EMAIL`, and the OTLP collector headers `OTEL_EXPORTER_OTLP_HEADERS` /
 `OTEL_EXPORTER_OTLP_*_HEADERS` (for example `OTEL_EXPORTER_OTLP_TRACES_HEADERS`). A script
 receives one only when the harness declares it, e.g. `JIRA_TOKEN: "${JIRA_TOKEN}"` under
@@ -172,7 +174,28 @@ breaks the hash-verified fetch cache.
 
 These rules make a run fail before `pre_script` starts:
 
-- **Refused names.** A key in the object may not be a runner-owned name. That covers `GH_WORKFLOW_TOKEN`, the OIDC request variables, provider-only keys such as `OPENAI_API_KEY`, the `FULLSEND_*`, `GITHUB_*`, `ACTIONS_*`, `RUNNER_*`, `CI_*`, `LD_*`, `OTEL_*`, `GOOGLE_*` and `CLOUDSDK_*` families, the minted role tokens (`GH_TOKEN`, `PUSH_TOKEN`, `PUSH_TOKEN_SOURCE`, `REVIEW_TOKEN`, `GITLAB_TOKEN`), `PATH`, and the sandbox-reserved names (`HOME`, `SHELL`, `TRACEPARENT`, …), and every name the reusable workflow sets on the `fullsend run` step, such as the named `JIRA_TOKEN`, `JIRA_USER_EMAIL` and `JIRA_BASE_URL` on `harness-run`. An `env.runner` key with one of those names may not receive a value from the object either.
+- **Refused names.** A key in the object may not be a runner-owned name. That
+  covers `GH_WORKFLOW_TOKEN`, the OIDC request variables, provider-only keys
+  such as `OPENAI_API_KEY`, the `FULLSEND_*`, `GITHUB_*`, `ACTIONS_*`,
+  `RUNNER_*`, `CI_*`, `LD_*`, `DYLD_*`, `OTEL_*`, `GOOGLE_*` and `CLOUDSDK_*`
+  families, the minted role tokens (`GH_TOKEN`, `PUSH_TOKEN`,
+  `PUSH_TOKEN_SOURCE`, `REVIEW_TOKEN`, `GITLAB_TOKEN`), `PATH`, the
+  runner-infrastructure names (`HOME`, `SHELL`, `BASH_ENV`, `ENV`,
+  `TRACEPARENT`), and every name the reusable workflow sets on the `fullsend
+  run` step, such as the named `JIRA_TOKEN`, `JIRA_USER_EMAIL` and
+  `JIRA_BASE_URL` on `harness-run`. An `env.runner` key with one of those names
+  may not receive a value from the object either. Credential-class names beyond
+  the runner-infrastructure names, `PATH`, and the `LD_*`/`DYLD_*` families —
+  proxy, TLS trust, Git, interpreter and shell-behavior variables such as
+  `HTTPS_PROXY`, `SSL_CERT_FILE`, `GIT_SSH_COMMAND`, `NODE_OPTIONS` and
+  `HOSTALIASES` — are **not** refused here: runner secrets reach host-side
+  scripts (`pre_script`, `post_script`, `validation_loop`) only as `env.runner`
+  values, and the sandbox gate independently blocks them from `env.sandbox`
+  exports; see [Migrating proxy and certificate
+  settings](../guides/user/customizing-agents.md#migrating-proxy-and-certificate-settings)
+  for where the proxy and TLS-trust settings go instead. Names are matched
+  case-insensitively, so `path` or `github_token` is refused like `PATH` or
+  `GITHUB_TOKEN`.
 - **Host side only.** The object's names may be referenced only from `env.runner` values. A reference from `env.sandbox`, `runner_env`, a provider's `credentials` or `config`, a `host_files` `src`, the content of a `host_files` entry with `expand: true`, or a `validation_loop` field is a validation error.
 - **Overlays.** An overlay that references one of the object's names may be guarded only by `runtime.forge` and `config`. An overlay that reads `event` or any other `runtime` field is refused, even when it does not match. This rule is interim until [ADR 0112](../ADRs/0112-overlays-may-set-any-harness-field.md)'s guarded-field check is implemented; until then an event-guarded overlay can still swap `pre_script`, `post_script` or `validation_loop`, and so choose which script receives a referenced value.
 - **Shape.** The value must be a JSON object whose values are strings, with no duplicate keys and no `null` values. Each value must be at least as long as the redactor's minimum (currently 8 characters), so it can be redacted. Errors name the offending key, never its value.
@@ -181,11 +204,56 @@ These rules make a run fail before `pre_script` starts:
 
 These rules cover names in the GitHub object only. GitLab is unchanged: each secret is its own masked CI/CD variable, `${NAME}` reads it directly, and no name is refused there (keeping fullsend's own credentials out of GitLab host-side scripts is tracked in [#8146](https://github.com/fullsend-ai/fullsend/issues/8146)). For setup, see [Building custom agents § Pass secrets to host-side scripts](../guides/user/building-custom-agents.md#pass-secrets-to-host-side-scripts-github).
 
+**`env.sandbox`** — Variables exported into the sandbox environment. Reserved
+names are dropped instead of exported, matched case-insensitively: the
+runner-infrastructure names (`PATH`, `HOME`, `SHELL`, `BASH_ENV`, `ENV`,
+`LD_PRELOAD`, `LD_LIBRARY_PATH`, `TRACEPARENT` and the `FULLSEND_*` names the
+runner reserves), the credentials it mints or receives and the runner-only
+inputs that select them, and the credential deny-list (proxy, TLS-trust, Git,
+interpreter, loader and shell-behavior names such as `HTTPS_PROXY`,
+`SSL_CERT_FILE`, `GIT_SSH_COMMAND`, `NODE_OPTIONS` and `IFS`). `fullsend run`
+warns once when the harness loads, naming every dropped key, and once per key on
+stderr as it writes the sandbox environment; `fullsend lock` prints the
+load-time warning when it composes a harness. The full list is in the
+`env.sandbox` note in [Customizing
+agents](../guides/user/customizing-agents.md#reserved-envsandbox-names),
+where blocked proxy and certificate settings go instead is in [Migrating proxy
+and certificate
+settings](../guides/user/customizing-agents.md#migrating-proxy-and-certificate-settings),
+and the warnings are described in [`fullsend run` § Reserved `env.sandbox`
+keys](../cli/run.md#reserved-envsandbox-keys).
+
 **`agent_input`** — A local directory, not a file. When a URL `base:` harness declares it, the inherited value is cleared rather than fetched; supply the directory in the child harness if needed. See [Harness field semantic types](../contributing/harness-fields.md#semantic-types-adr-0127).
 
-**`host_files[].dest`** — An absolute path under `/sandbox/` or `/tmp/`. Paths the runner writes or puts on `PATH` ahead of the image are refused when the harness loads: `/sandbox/workspace/.env`, the runner and runtime binaries in `/sandbox/workspace/bin` (`claude`, `codex`, `pi`, `opencode`, `fullsend`, `fullsend-check-output`), and anything under `/sandbox/claude-config`, `/sandbox/codex-config`, `/sandbox/pi-config`, `/sandbox/workspace/.fullsend`, `/sandbox/workspace/.security`, `/sandbox/.venv` or `/sandbox/go/bin`. A `dest` containing a `..` path component is refused as well. The same rule applies to `host_files` under `overlays:`, `forge:` and inherited from `base:`. On Claude and pi runs `/sandbox/workspace/bin` is last on the agent's `PATH`, so a file there adds a command but does not replace one the image provides. Codex runs restore the `PATH` from before `.env`, so `/sandbox/workspace/bin` and `.env.d` additions are not on the codex agent's `PATH`. See [Adding executables](../guides/user/customizing-agents.md#adding-executables).
+**`host_files[].dest`** — An absolute path under `/sandbox/` or `/tmp/`. Paths the runner writes or puts on `PATH` ahead of the image are refused when the harness loads: `/sandbox/workspace/.env`, the runner and runtime binaries in `/sandbox/workspace/bin` (`claude`, `codex`, `pi`, `opencode`, `fullsend`, `fullsend-check-output`), and anything under `/sandbox/claude-config`, `/sandbox/codex-config`, `/sandbox/pi-config`, `/sandbox/workspace/.fullsend`, `/sandbox/workspace/.security`, `/sandbox/.venv` or `/sandbox/go/bin`. A `dest` containing a `..` path component is refused as well. The same rule applies to `host_files` under `overlays:`, `forge:` and inherited from `base:`. On Claude and pi runs `/sandbox/workspace/bin` is last on the agent's `PATH`, so a file there adds a command but does not replace one the image provides. Codex and OpenCode runs restore the `PATH` from before `.env`, so `/sandbox/workspace/bin` and `.env.d` additions are not on the codex or OpenCode agent's `PATH`. See [Adding executables](../guides/user/customizing-agents.md#adding-executables).
 
-**`.env.d` host files** — A `host_files` entry with a `dest` in `/sandbox/workspace/.env.d/` ending in `.env` is sourced as shell in the agent launch shell, before the runtime starts. Treat these files like `pre_script`: they run whatever they contain. `host_files` can also place configuration that tools load, such as git config or shell rc files; that is trusted like `pre_script` too. After the `.env.d` files run, on Claude and pi runs the runner puts its own `PATH` back in front. Claude runs then unset `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`, `NODE_OPTIONS`, `NODE_PATH` and `BUN_OPTIONS`; codex runs unset the same names except `BUN_OPTIONS`. Setting those there has no effect on the agent of those runtimes.
+**`.env.d` host files** — A `host_files` entry with a `dest` in
+`/sandbox/workspace/.env.d/` ending in `.env` is read before the runtime starts.
+Claude, codex, pi and OpenCode launches, and the runner's own in-sandbox probes
+(the pre-agent context scan, the GitHub preflight and the runtime bootstrap
+reads), read these files, like `.env` itself, as data: only `[export
+]NAME=value` assignments, `export NAME` and comments are taken (values may be
+quoted and may use `$NAME`, `${NAME}` and a leading `~`), and any other line is
+ignored with a warning that names the file and line number. Shell forms that
+these launches ignore include `${NAME:-default}` and every other `${...}` form
+beyond `${NAME}`, `export A=1 B=2` (put one assignment on each line), `FOO=x;
+export FOO` (write `export FOO=x`), and a value containing a NUL byte. An
+`.env.d` directory or an included file that exists but cannot be read fails the
+launch. `.env` itself stays valid shell, and a shell that sources it (such as an
+agent running `. /sandbox/workspace/.env`) runs these files too, so still treat
+them like `pre_script`. `host_files` can also place configuration that tools
+load, such as git config or shell rc files; that is trusted like `pre_script`
+too. After the `.env.d` files are read, on Claude and pi runs the runner puts
+its own `PATH` back in front; OpenCode runs restore the `PATH` from before
+`.env`. `LD_PRELOAD`, `LD_LIBRARY_PATH`, `LD_AUDIT`, every `PYTHON*` variable,
+`BASH_ENV`, `ENV` and `IFS` are never taken from `.env` or `.env.d` on Claude,
+codex, pi or OpenCode runs. Claude runs also unset `LD_PRELOAD`,
+`LD_LIBRARY_PATH`, `LD_AUDIT`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`,
+`NODE_OPTIONS`, `NODE_PATH` and `BUN_OPTIONS`, plus the Claude Code variables
+`CLAUDE_CODE_SAFE_MODE`, `CLAUDE_CODE_SIMPLE`, `CLAUDE_CODE_SHELL_PREFIX` and
+`CLAUDE_CODE_SUBPROCESS_ENV_SCRUB`; codex runs unset the same loader names
+except `BUN_OPTIONS`. Setting those there has no effect on the agent of those
+runtimes.
 
 
 **`policy`** — Path or pinned URL of the sandbox policy. Required at `fullsend run`; fullsend ships no default. A child that omits `policy:` still passes if it inherits one from `base:`. A local file that unmarshals to no fields (comments only) is rejected with the path named. Commit a copy of the fleet policy from [fullsend-ai/agents](https://github.com/fullsend-ai/agents), or set `policy:` to its URL with a `#sha256=` hash under `allowed_remote_resources`; `fullsend agent new` writes both the file and the field for a new agent.
@@ -282,7 +350,7 @@ agent: https://raw.githubusercontent.com/org/repo/<sha>/agents/lint.md#sha256=ab
 
 **Scripts are local-only** — `pre_script`, `post_script`, and `validation_loop.script` must be local paths (they run on the trusted runner). Exception: scripts declared in a `base` harness fetched via URL are allowed.
 
-**`validation_loop.preflight_check` is a command, not a script resource** — The runner expands `${VAR}` references from its permitted host environment, then passes the result to `sh -c` on the host; it does not fetch or stage a file named by the command. Do not interpolate untrusted values or credentials, even within shell quotes: on failure or timeout the expanded command currently appears in diagnostics.
+**`validation_loop.preflight_check` is a command, not a script resource** — The runner validates `${VAR}` references against the preflight allowlist environment (host `PATH`/`HOME`/`TMPDIR`, runner-forced `FULLSEND_DIR`/`PYTHONDONTWRITEBYTECODE`, and `env.runner` declarations), expands them, and passes the result to `sh -c` on the host; it does not fetch or stage a file named by the command. A reference outside that environment — including any credential name, whether inherited from the process environment or declared under `env.runner` — fails the run before the command executes. Do not interpolate untrusted values, even within shell quotes: on failure or timeout the diagnostics embed the command and output with declared secret values redacted.
 
 ## See also
 
